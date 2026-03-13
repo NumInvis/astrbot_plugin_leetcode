@@ -166,7 +166,15 @@ class LeetCodePlugin(Star):
 
     async def initialize(self):
         """插件初始化时执行"""
-        self._session = aiohttp.ClientSession()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Content-Type": "application/json",
+            "Origin": "https://leetcode.cn",
+            "Referer": "https://leetcode.cn/"
+        }
+        self._session = aiohttp.ClientSession(headers=headers)
         self._monitor_task = asyncio.create_task(self._async_monitor())
 
     async def terminate(self):
@@ -223,25 +231,17 @@ class LeetCodePlugin(Star):
             url = "https://leetcode.cn/graphql"
             query = """
             query questionOfToday {
-              activeDailyCodingChallengeQuestion {
+              todayRecord {
                 date
                 userStatus
-                link
                 question {
                   acRate
                   difficulty
-                  freqBar
                   frontendQuestionId: questionFrontendId
-                  isFavor
-                  paidOnly: isPaidOnly
-                  status
                   title
                   titleSlug
-                  hasVideoSolution
-                  hasSolution
                   topicTags {
                     name
-                    id
                     slug
                   }
                 }
@@ -262,23 +262,25 @@ class LeetCodePlugin(Star):
                 if response.status == 200:
                     import json
                     data = json.loads(response_text)
-                    daily_data = data.get("data", {}).get("activeDailyCodingChallengeQuestion")
-                    if daily_data:
+                    today_records = data.get("data", {}).get("todayRecord", [])
+                    if today_records and len(today_records) &gt; 0:
+                        daily_data = today_records[0]
                         question = daily_data.get("question", {})
+                        title_slug = question.get("titleSlug")
                         result = {
                             "date": daily_data.get("date"),
                             "title": question.get("title"),
-                            "titleSlug": question.get("titleSlug"),
+                            "titleSlug": title_slug,
                             "frontendQuestionId": question.get("frontendQuestionId"),
                             "difficulty": question.get("difficulty"),
                             "acRate": question.get("acRate"),
-                            "link": f"https://leetcode.cn{daily_data.get('link', '')}",
+                            "link": f"https://leetcode.cn/problems/{title_slug}/",
                             "topicTags": [tag.get("name") for tag in question.get("topicTags", [])]
                         }
                         logger.info(f"成功获取题目: {result}")
                         return result
                     else:
-                        logger.error("未找到 activeDailyCodingChallengeQuestion 数据")
+                        logger.error("未找到 todayRecord 数据")
                 else:
                     logger.error(f"请求失败，状态码: {response.status}")
         except Exception as e:
