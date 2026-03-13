@@ -214,8 +214,15 @@ class LeetCodePlugin(Star):
     async def _fetch_daily_question(self) -> Optional[Dict]:
         """获取 LeetCode 每日一题 - 使用内置的 urllib"""
         try:
+            import os
             import urllib.request
             import ssl
+            
+            # 清除代理环境变量
+            for key in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 
+                        'all_proxy', 'ALL_PROXY', 'no_proxy', 'NO_PROXY']:
+                if key in os.environ:
+                    del os.environ[key]
             
             url = "https://leetcode-api-pied.vercel.app/daily"
             logger.info(f"正在向 {url} 发送请求")
