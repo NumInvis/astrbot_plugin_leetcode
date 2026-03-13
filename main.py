@@ -127,7 +127,7 @@ class LeetCodePlugin(Star):
         self.admin_users = default_config["admin_users"]
         self.subscribed_groups: List[str] = default_config["subscribed_groups"]
 
-    def _get_group_id(self, event: AstrMessageEvent) -> Optional[str]:
+    def _get_group_id(self, event: AstrMessageEvent) -&gt; Optional[str]:
         """获取群组ID"""
         group_id = event.get_group_id()
         if group_id:
@@ -137,14 +137,16 @@ class LeetCodePlugin(Star):
     def _save_group_origin(self, event: AstrMessageEvent):
         """保存群的统一会话标识"""
         group_id = self._get_group_id(event)
-        if group_id:
+        if group_id and hasattr(event, 'unified_msg_origin'):
             self.group_origins[group_id] = event.unified_msg_origin
 
-    def _get_session_for_group(self, group_id: str) -> str:
+    def _get_session_for_group(self, group_id: str) -&gt; str:
         """获取群的会话标识"""
-        return self.group_origins.get(group_id, group_id)
+        if group_id in self.group_origins:
+            return self.group_origins[group_id]
+        return group_id
 
-    def _is_admin(self, event: AstrMessageEvent) -> bool:
+    def _is_admin(self, event: AstrMessageEvent) -&gt; bool:
         """检查用户是否为管理员"""
         if event.is_admin():
             return True
@@ -221,7 +223,7 @@ class LeetCodePlugin(Star):
         except asyncio.CancelledError:
             logger.info("LeetCode 每日一题监控任务已停止")
 
-    async def _fetch_daily_question(self) -> Optional[Dict]:
+    async def _fetch_daily_question(self) -&gt; Optional[Dict]:
         """获取 LeetCode 每日一题"""
         if not self._session:
             logger.error("HTTP 会话未初始化")
@@ -235,15 +237,28 @@ class LeetCodePlugin(Star):
                 date
                 userStatus
                 question {
-                  acRate
-                  difficulty
+                  questionId
                   frontendQuestionId: questionFrontendId
+                  difficulty
                   title
+                  titleCn: translatedTitle
                   titleSlug
+                  paidOnly: isPaidOnly
+                  freqBar
+                  isFavor
+                  acRate
+                  status
+                  solutionNum
+                  hasVideoSolution
                   topicTags {
                     name
+                    nameTranslated: translatedName
+                    id
                     slug
                   }
+                }
+                lastSubmission {
+                  id
                 }
               }
             }
@@ -252,7 +267,11 @@ class LeetCodePlugin(Star):
             logger.info(f"正在向 {url} 发送请求")
             async with self._session.post(
                 url,
-                json={"query": query},
+                json={
+                    "query": query,
+                    "variables": {},
+                    "operationName": "questionOfToday"
+                },
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 logger.info(f"响应状态码: {response.status}")
@@ -270,12 +289,13 @@ class LeetCodePlugin(Star):
                         result = {
                             "date": daily_data.get("date"),
                             "title": question.get("title"),
+                            "titleCn": question.get("titleCn"),
                             "titleSlug": title_slug,
                             "frontendQuestionId": question.get("frontendQuestionId"),
                             "difficulty": question.get("difficulty"),
                             "acRate": question.get("acRate"),
                             "link": f"https://leetcode.cn/problems/{title_slug}/",
-                            "topicTags": [tag.get("name") for tag in question.get("topicTags", [])]
+                            "topicTags": question.get("topicTags", [])
                         }
                         logger.info(f"成功获取题目: {result}")
                         return result
@@ -288,7 +308,7 @@ class LeetCodePlugin(Star):
 
         return None
 
-    def _build_question_message(self, question: Dict) -> List:
+    def _build_question_message(self, question: Dict) -&gt; List:
         """构建题目消息"""
         chain = []
 
@@ -298,19 +318,37 @@ class LeetCodePlugin(Star):
             "Hard": "🔴"
         }
 
+        difficulty_cn = {
+            "Easy": "简单",
+            "Medium": "中等",
+            "Hard": "困难"
+        }
+
         emoji = difficulty_emoji.get(question.get("difficulty", ""), "⚪")
+        title_cn = question.get("titleCn") or question.get("title", "未知题目")
         title = question.get("title", "未知题目")
         qid = question.get("frontendQuestionId", "")
         difficulty = question.get("difficulty", "")
+        difficulty_cn_text = difficulty_cn.get(difficulty, difficulty)
         ac_rate = question.get("acRate", 0)
         link = question.get("link", "")
-        tags = question.get("topicTags", [])
+        
+        tags = []
+        for tag in question.get("topicTags", []):
+            if isinstance(tag, dict):
+                tag_name = tag.get("nameTranslated") or tag.get("name", "")
+                if tag_name:
+                    tags.append(tag_name)
+            else:
+                tags.append(str(tag))
 
         chain.append(Comp.Plain(f"📅 {question.get('date', '')}\n"))
-        chain.append(Comp.Plain(f"{emoji} 【{qid}. {title}】\n"))
-        chain.append(Comp.Plain(f"难度: {difficulty}\n"))
+        chain.append(Comp.Plain(f"{emoji} 【{qid}. {title_cn}】\n"))
+        if title_cn != title:
+            chain.append(Comp.Plain(f"英文标题: {title}\n"))
+        chain.append(Comp.Plain(f"难度: {difficulty_cn_text}\n"))
         if ac_rate:
-            chain.append(Comp.Plain(f"通过率: {ac_rate:.1f}%\n"))
+            chain.append(Comp.Plain(f"通过率: {ac_rate * 100:.1f}%\n"))
         if tags:
             chain.append(Comp.Plain(f"标签: {', '.join(tags)}\n"))
         chain.append(Comp.Plain(f"🔗 链接: {link}"))
