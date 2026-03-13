@@ -232,18 +232,18 @@ class LeetCodePlugin(Star):
         try:
             import urllib.request
             import ssl
-            
+
             url = "https://leetcode-api-pied.vercel.app/daily"
             logger.info(f"正在向 {url} 发送请求")
-            
+
             # 创建SSL上下文，忽略证书验证
             ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
-            
+
             # 使用线程池执行同步请求
             loop = asyncio.get_event_loop()
-            
+
             def fetch():
                 req = urllib.request.Request(
                     url,
@@ -253,24 +253,24 @@ class LeetCodePlugin(Star):
                 )
                 with urllib.request.urlopen(req, context=ssl_context, timeout=30) as response:
                     return response.read().decode('utf-8')
-            
+
             response_text = await loop.run_in_executor(None, fetch)
             logger.info(f"响应内容: {response_text[:200]}")
-            
+
             data = json.loads(response_text)
             question = data.get("question", {})
             link = data.get("link", "")
             title_slug = question.get("titleSlug")
-            
+
             # 获取标题（优先使用中文标题，如果没有则使用英文）
             title = question.get("title", "")
             title_cn = question.get("translatedTitle")
             if not title_cn:
                 title_cn = title
-            
+
             # 获取题目内容（HTML格式，需要清理）
             content_html = question.get("content", "")
-            
+
             result = {
                 "date": data.get("date"),
                 "title": title,
@@ -283,11 +283,71 @@ class LeetCodePlugin(Star):
                 "topicTags": question.get("topicTags", []),
                 "content": content_html
             }
-            
+
             logger.info(f"成功获取题目: {result}")
             return result
         except Exception as e:
             logger.error(f"获取 LeetCode 每日一题失败: {e}", exc_info=True)
+
+        return None
+
+    async def _fetch_question_by_id(self, question_id: str) -> Optional[Dict]:
+        """根据题目号获取 LeetCode 题目详情"""
+        try:
+            import urllib.request
+            import ssl
+
+            # 使用 lcid.cc API 获取题目信息
+            url = f"https://lcid.cc/info/{question_id}"
+            logger.info(f"正在获取题目 {question_id}: {url}")
+
+            # 创建SSL上下文，忽略证书验证
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+
+            # 使用线程池执行同步请求
+            loop = asyncio.get_event_loop()
+
+            def fetch():
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    }
+                )
+                with urllib.request.urlopen(req, context=ssl_context, timeout=30) as response:
+                    return response.read().decode('utf-8')
+
+            response_text = await loop.run_in_executor(None, fetch)
+            logger.info(f"题目 {question_id} 响应: {response_text[:200]}")
+
+            data = json.loads(response_text)
+
+            # 获取标题（优先使用中文标题）
+            title = data.get("title", "")
+            title_cn = data.get("title_cn", "")
+            if not title_cn:
+                title_cn = title
+
+            # 构建结果
+            result = {
+                "date": "",
+                "title": title,
+                "titleCn": title_cn,
+                "titleSlug": data.get("slug", ""),
+                "frontendQuestionId": str(data.get("id", question_id)),
+                "difficulty": data.get("difficulty", ""),
+                "acRate": 0,
+                "link": f"https://leetcode.com/problems/{data.get('slug', '')}/",
+                "topicTags": [],
+                "content": data.get("content", "")
+            }
+
+            logger.info(f"成功获取题目 {question_id}: {result['title']}")
+            return result
+        except Exception as e:
+            logger.error(f"获取题目 {question_id} 失败: {e}", exc_info=True)
 
         return None
 
@@ -335,18 +395,18 @@ class LeetCodePlugin(Star):
         if tags:
             chain.append(Comp.Plain(f"标签: {', '.join(tags)}\n"))
         chain.append(Comp.Plain(f"🔗 链接: {link}\n"))
-        
-        # 添加题目内容摘要
+
+        # 添加完整题目内容
         content = question.get("content", "")
         if content:
             clean_content = clean_html(content)
-            # 只显示前300个字符作为摘要
-            if len(clean_content) > 300:
-                summary = clean_content[:300] + "..."
+            chain.append(Comp.Plain(f"\n📝 题目描述:\n"))
+            # 分段发送，避免消息过长
+            max_length = 1500
+            if len(clean_content) > max_length:
+                chain.append(Comp.Plain(clean_content[:max_length] + "\n\n... (内容已截断，请访问链接查看完整题目)"))
             else:
-                summary = clean_content
-            chain.append(Comp.Plain(f"\n📝 题目描述:\n{summary}\n"))
-            chain.append(Comp.Plain("💡 使用 /lc解析 获取完整题目解析"))
+                chain.append(Comp.Plain(clean_content))
 
         return chain
 
@@ -386,9 +446,9 @@ class LeetCodePlugin(Star):
         msg = """🤖 LeetCode 每日一题 - 主菜单
 
 【查询命令】
-📋 /lc今日 - 立即获取今日题目（含题目描述）
-📖 /lc解析 - 获取完整题目内容
-🤖 /lc解题 - 使用AI分析并解答题目
+📋 /lc今日 - 立即获取今日题目（含完整描述）
+🔍 /lc题目 [题号] - 查询指定题目（如: /lc题目 1）
+🤖 /lc解题 - 使用AI分析并解答今日题目
 📋 /lc列表 - 查看当前群订阅状态
 
 【管理命令】
@@ -410,8 +470,10 @@ class LeetCodePlugin(Star):
         msg = """📖 LeetCode 每日一题 - 详细使用说明
 
 【查询命令】
-1️⃣ /lc今日 - 立即获取并显示今日题目（含题目描述摘要）
-2️⃣ /lc解析 - 获取完整题目内容和描述
+1️⃣ /lc今日 - 立即获取并显示今日题目（含完整描述）
+2️⃣ /lc题目 [题号] - 查询指定题号的题目
+   示例: /lc题目 1 (查询两数之和)
+   示例: /lc题目  (不传参数则获取今日题目)
 3️⃣ /lc解题 - 使用AI分析题目并提供解题思路、代码和关键点
 4️⃣ /lc列表 - 查看当前群是否已订阅
 
@@ -539,43 +601,43 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
 
         yield event.plain_result("\n".join(lines))
 
-    @filter.command("lc解析")
-    async def cmd_parse(self, event: AstrMessageEvent):
-        """获取今日题目的完整解析"""
+    @filter.command("lc题目")
+    async def cmd_question(self, event: AstrMessageEvent, question_id: str = ""):
+        """根据题目号查询题目，不传参数则获取今日题目"""
         self._save_group_origin(event)
 
-        today_date = datetime.now().strftime("%Y-%m-%d")
+        if not question_id:
+            # 没有提供题目号，获取今日题目
+            today_date = datetime.now().strftime("%Y-%m-%d")
 
-        # 检查缓存
-        if self.today_question and self.today_date == today_date:
-            question = self.today_question
+            # 检查缓存
+            if self.today_question and self.today_date == today_date:
+                question = self.today_question
+            else:
+                yield event.plain_result("⏳ 正在获取今日题目...")
+                question = await self._fetch_daily_question()
+                if question:
+                    self.today_question = question
+                    self.today_date = today_date
+
+            if not question:
+                yield event.plain_result("❌ 获取今日题目失败，请稍后再试")
+                return
+
+            chain = self._build_question_message(question)
+            yield event.chain_result(chain)
         else:
-            yield event.plain_result("⏳ 正在获取今日题目...")
-            question = await self._fetch_daily_question()
-            if question:
-                self.today_question = question
-                self.today_date = today_date
+            # 提供了题目号，查询指定题目
+            yield event.plain_result(f"⏳ 正在查询题目 {question_id}...")
 
-        if not question:
-            yield event.plain_result("❌ 获取今日题目失败，请稍后再试")
-            return
+            question = await self._fetch_question_by_id(question_id)
 
-        content = question.get("content", "")
-        if not content:
-            yield event.plain_result("❌ 暂无题目内容")
-            return
+            if not question:
+                yield event.plain_result(f"❌ 未找到题目 {question_id}，请检查题号是否正确")
+                return
 
-        clean_content = clean_html(content)
-        title_cn = question.get("titleCn") or question.get("title", "未知题目")
-        qid = question.get("frontendQuestionId", "")
-
-        msg = f"📖 【{qid}. {title_cn}】完整题目\n"
-        msg += "=" * 40 + "\n\n"
-        msg += clean_content[:2000]  # 限制长度避免消息过长
-        if len(clean_content) > 2000:
-            msg += "\n\n... (内容已截断，请访问链接查看完整题目)"
-
-        yield event.plain_result(msg)
+            chain = self._build_question_message(question)
+            yield event.chain_result(chain)
 
     @filter.command("lc解题")
     async def cmd_solve(self, event: AstrMessageEvent):
