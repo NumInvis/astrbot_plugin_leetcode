@@ -1,22 +1,4 @@
 {
-  "check_interval_seconds": {
-    "description": "检查间隔（秒）",
-    "type": "int",
-    "hint": "检查每日一题的间隔时间，单位为秒",
-    "default": 3600
-  },
-  "inform_hour": {
-    "description": "提醒时间（小时）",
-    "type": "int",
-    "hint": "每日提醒的小时数（24小时制）",
-    "default": 9
-  },
-  "inform_minute": {
-    "description": "提醒时间（分钟）",
-    "type": "int",
-    "hint": "每日提醒的分钟数",
-    "default": 0
-  },
   "admin_users": {
     "description": "管理员用户列表",
     "type": "list",
