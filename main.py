@@ -127,10 +127,18 @@ class LeetCodePlugin(Star):
         self.admin_users = default_config["admin_users"]
         self.subscribed_groups: List[str] = default_config["subscribed_groups"]
 
+    def _get_group_id(self, event: AstrMessageEvent) -> Optional[str]:
+        """获取群组ID"""
+        group_id = event.get_group_id()
+        if group_id:
+            return str(group_id)
+        return None
+
     def _save_group_origin(self, event: AstrMessageEvent):
         """保存群的统一会话标识"""
-        if event.group_id:
-            self.group_origins[event.group_id] = event.unified_msg_origin
+        group_id = self._get_group_id(event)
+        if group_id:
+            self.group_origins[group_id] = event.unified_msg_origin
 
     def _get_session_for_group(self, group_id: str) -> str:
         """获取群的会话标识"""
@@ -208,6 +216,7 @@ class LeetCodePlugin(Star):
     async def _fetch_daily_question(self) -> Optional[Dict]:
         """获取 LeetCode 每日一题"""
         if not self._session:
+            logger.error("HTTP 会话未初始化")
             return None
 
         try:
@@ -240,17 +249,23 @@ class LeetCodePlugin(Star):
             }
             """
 
+            logger.info(f"正在向 {url} 发送请求")
             async with self._session.post(
                 url,
                 json={"query": query},
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
-                data = await response.json()
+                logger.info(f"响应状态码: {response.status}")
+                response_text = await response.text()
+                logger.info(f"响应内容: {response_text[:500]}")
+                
                 if response.status == 200:
+                    import json
+                    data = json.loads(response_text)
                     daily_data = data.get("data", {}).get("activeDailyCodingChallengeQuestion")
                     if daily_data:
                         question = daily_data.get("question", {})
-                        return {
+                        result = {
                             "date": daily_data.get("date"),
                             "title": question.get("title"),
                             "titleSlug": question.get("titleSlug"),
@@ -260,8 +275,14 @@ class LeetCodePlugin(Star):
                             "link": f"https://leetcode.cn{daily_data.get('link', '')}",
                             "topicTags": [tag.get("name") for tag in question.get("topicTags", [])]
                         }
+                        logger.info(f"成功获取题目: {result}")
+                        return result
+                    else:
+                        logger.error("未找到 activeDailyCodingChallengeQuestion 数据")
+                else:
+                    logger.error(f"请求失败，状态码: {response.status}")
         except Exception as e:
-            logger.error(f"获取 LeetCode 每日一题失败: {e}")
+            logger.error(f"获取 LeetCode 每日一题失败: {e}", exc_info=True)
 
         return None
 
@@ -378,11 +399,10 @@ class LeetCodePlugin(Star):
             yield event.plain_result("⚠️ 只有管理员可以使用此命令")
             return
 
-        if not event.group_id:
+        group_id = self._get_group_id(event)
+        if not group_id:
             yield event.plain_result("❌ 此命令只能在群聊中使用")
             return
-
-        group_id = event.group_id
 
         if group_id in self.subscribed_groups:
             yield event.plain_result("❌ 本群已经订阅了 LeetCode 每日一题")
@@ -401,11 +421,10 @@ class LeetCodePlugin(Star):
             yield event.plain_result("⚠️ 只有管理员可以使用此命令")
             return
 
-        if not event.group_id:
+        group_id = self._get_group_id(event)
+        if not group_id:
             yield event.plain_result("❌ 此命令只能在群聊中使用")
             return
-
-        group_id = event.group_id
 
         if group_id not in self.subscribed_groups:
             yield event.plain_result("❌ 本群没有订阅 LeetCode 每日一题")
@@ -448,11 +467,10 @@ class LeetCodePlugin(Star):
             yield event.plain_result("⚠️ 只有管理员可以使用此命令")
             return
 
-        if not event.group_id:
+        group_id = self._get_group_id(event)
+        if not group_id:
             yield event.plain_result("❌ 此命令只能在群聊中使用")
             return
-
-        group_id = event.group_id
 
         if group_id in self.subscribed_groups:
             yield event.plain_result(f"✅ 本群已订阅 LeetCode 每日一题\n每日 {self.inform_hour:02d}:{self.inform_minute:02d} 推送")
