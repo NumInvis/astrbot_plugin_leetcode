@@ -10,7 +10,7 @@ import os
 from datetime import datetime
 from typing import Dict, List, Optional, Set
 
-import aiohttp
+import requests
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register, StarTools
@@ -53,7 +53,7 @@ class LeetCodePlugin(Star):
         self.today_date: str = ""
 
         # HTTP 会话
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session = None
 
         # 全局管理员列表
         global ADMIN_USERS
@@ -168,11 +168,6 @@ class LeetCodePlugin(Star):
 
     async def initialize(self):
         """插件初始化时执行"""
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json"
-        }
-        self._session = aiohttp.ClientSession(headers=headers)
         self._monitor_task = asyncio.create_task(self._async_monitor())
 
     async def terminate(self):
@@ -183,8 +178,6 @@ class LeetCodePlugin(Star):
                 await self._monitor_task
             except asyncio.CancelledError:
                 pass
-        if self._session:
-            await self._session.close()
 
     async def _async_monitor(self):
         """异步监控任务"""
@@ -221,50 +214,48 @@ class LeetCodePlugin(Star):
 
     async def _fetch_daily_question(self) -> Optional[Dict]:
         """获取 LeetCode 每日一题 - 使用可靠的第三方 API"""
-        if not self._session:
-            logger.error("HTTP 会话未初始化")
-            return None
-
         try:
             url = "https://leetcode-api-pied.vercel.app/daily"
             logger.info(f"正在向 {url} 发送请求")
             
-            async with self._session.get(
-                url,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                logger.info(f"响应状态码: {response.status}")
+            # 使用线程池执行同步的requests请求
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, 
+                lambda: requests.get(url, timeout=30)
+            )
+            
+            logger.info(f"响应状态码: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                question = data.get("question", {})
+                link = data.get("link", "")
+                title_slug = question.get("titleSlug")
                 
-                if response.status == 200:
-                    data = await response.json()
-                    question = data.get("question", {})
-                    link = data.get("link", "")
-                    title_slug = question.get("titleSlug")
-                    
-                    # 获取标题（优先使用中文标题，如果没有则使用英文）
-                    title = question.get("title", "")
-                    title_cn = question.get("translatedTitle")
-                    if not title_cn:
-                        title_cn = title
-                    
-                    result = {
-                        "date": data.get("date"),
-                        "title": title,
-                        "titleCn": title_cn,
-                        "titleSlug": title_slug,
-                        "frontendQuestionId": question.get("questionFrontendId"),
-                        "difficulty": question.get("difficulty"),
-                        "acRate": question.get("acRate", 0) / 100.0 if question.get("acRate") else 0,
-                        "link": f"https://leetcode.com{link}" if link.startswith("/") else link,
-                        "topicTags": question.get("topicTags", [])
-                    }
-                    
-                    logger.info(f"成功获取题目: {result}")
-                    return result
-                else:
-                    logger.error(f"请求失败，状态码: {response.status}")
-                    response_text = await response.text()
-                    logger.error(f"响应内容: {response_text}")
+                # 获取标题（优先使用中文标题，如果没有则使用英文）
+                title = question.get("title", "")
+                title_cn = question.get("translatedTitle")
+                if not title_cn:
+                    title_cn = title
+                
+                result = {
+                    "date": data.get("date"),
+                    "title": title,
+                    "titleCn": title_cn,
+                    "titleSlug": title_slug,
+                    "frontendQuestionId": question.get("questionFrontendId"),
+                    "difficulty": question.get("difficulty"),
+                    "acRate": question.get("acRate", 0) / 100.0 if question.get("acRate") else 0,
+                    "link": f"https://leetcode.com{link}" if link.startswith("/") else link,
+                    "topicTags": question.get("topicTags", [])
+                }
+                
+                logger.info(f"成功获取题目: {result}")
+                return result
+            else:
+                logger.error(f"请求失败，状态码: {response.status_code}")
+                logger.error(f"响应内容: {response.text}")
         except Exception as e:
             logger.error(f"获取 LeetCode 每日一题失败: {e}", exc_info=True)
 
