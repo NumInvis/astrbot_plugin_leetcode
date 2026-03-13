@@ -241,15 +241,21 @@ class LeetCodePlugin(Star):
                     link = data.get("link", "")
                     title_slug = question.get("titleSlug")
                     
+                    # 获取标题（优先使用中文标题，如果没有则使用英文）
+                    title = question.get("title", "")
+                    title_cn = question.get("translatedTitle")
+                    if not title_cn:
+                        title_cn = title
+                    
                     result = {
                         "date": data.get("date"),
-                        "title": question.get("title"),
-                        "titleCn": question.get("translatedTitle"),
+                        "title": title,
+                        "titleCn": title_cn,
                         "titleSlug": title_slug,
                         "frontendQuestionId": question.get("questionFrontendId"),
                         "difficulty": question.get("difficulty"),
                         "acRate": question.get("acRate", 0) / 100.0 if question.get("acRate") else 0,
-                        "link": f"https://leetcode.cn{link}" if link.startswith("/") else link,
+                        "link": f"https://leetcode.com{link}" if link.startswith("/") else link,
                         "topicTags": question.get("topicTags", [])
                     }
                     
