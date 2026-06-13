@@ -23,6 +23,9 @@ from ._version import __version__, __plugin_name__, __author__, __plugin_desc__
 # 配置项默认值
 DEFAULTS = {
     "admin_users": [],
+    "group_inform_hour": 9,
+    "group_inform_minute": 0,
+    "check_interval_seconds": 30,
     "default_language": "zh",
     "enable_personal_subscribe": True,
     "personal_inform_hour": 9,
@@ -36,8 +39,51 @@ DEFAULTS = {
 
 def _get(config: dict, key: str):
     """从配置中读取值，缺失或为 None 时回退到默认值。"""
+    if not config:
+        return DEFAULTS[key]
     val = config.get(key)
     return val if val is not None else DEFAULTS[key]
+
+
+def _parse_bool(value, key: str) -> bool:
+    """解析布尔配置，兼容少量字符串写法。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "on", "开启", "启用"):
+            return True
+        if normalized in ("false", "0", "no", "off", "关闭", "禁用"):
+            return False
+    logger.warning(f"配置项 {key} 的值无效: {value!r}，已回退为默认值 {DEFAULTS[key]!r}")
+    return bool(DEFAULTS[key])
+
+
+def _parse_int_range(value, key: str, min_value: int, max_value: int) -> int:
+    """解析整数配置并限制范围，避免时间/间隔乱填导致插件启动失败。"""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        logger.warning(f"配置项 {key} 的值无效: {value!r}，已回退为默认值 {DEFAULTS[key]!r}")
+        return int(DEFAULTS[key])
+
+    if min_value <= parsed <= max_value:
+        return parsed
+
+    logger.warning(
+        f"配置项 {key} 超出范围: {parsed}，有效范围为 {min_value}-{max_value}，"
+        f"已回退为默认值 {DEFAULTS[key]!r}"
+    )
+    return int(DEFAULTS[key])
+
+
+def _parse_language(value) -> str:
+    """解析默认语言配置。"""
+    language = str(value or "").strip().lower()
+    if language in ("zh", "en", "both"):
+        return language
+    logger.warning(f"default_language 配置无效: {value!r}，已回退为默认值 {DEFAULTS['default_language']!r}")
+    return DEFAULTS["default_language"]
 
 
 class _LeetCodeHTMLToMarkdown(HTMLParser):
@@ -226,13 +272,16 @@ class LeetCodePlugin(Star):
 
         # 从 AstrBotConfig 读取配置
         self.admin_users: list = [str(u) for u in _get(config, "admin_users")]
-        self.default_language: str = _get(config, "default_language")
-        self.enable_personal_subscribe: bool = bool(_get(config, "enable_personal_subscribe"))
-        self.personal_inform_hour: int = int(_get(config, "personal_inform_hour"))
-        self.personal_inform_minute: int = int(_get(config, "personal_inform_minute"))
-        self.enable_llm_translation: bool = bool(_get(config, "enable_llm_translation"))
-        self.translation_provider_id: str = _get(config, "translation_provider_id")
-        self.enable_image_push: bool = bool(_get(config, "enable_image_push"))
+        self.default_language: str = _parse_language(_get(config, "default_language"))
+        self.enable_personal_subscribe: bool = _parse_bool(_get(config, "enable_personal_subscribe"), "enable_personal_subscribe")
+        self.personal_inform_hour: int = _parse_int_range(_get(config, "personal_inform_hour"), "personal_inform_hour", 0, 23)
+        self.personal_inform_minute: int = _parse_int_range(_get(config, "personal_inform_minute"), "personal_inform_minute", 0, 59)
+        self.group_inform_hour: int = _parse_int_range(_get(config, "group_inform_hour"), "group_inform_hour", 0, 23)
+        self.group_inform_minute: int = _parse_int_range(_get(config, "group_inform_minute"), "group_inform_minute", 0, 59)
+        self.check_interval_seconds: int = _parse_int_range(_get(config, "check_interval_seconds"), "check_interval_seconds", 5, 3600)
+        self.enable_llm_translation: bool = _parse_bool(_get(config, "enable_llm_translation"), "enable_llm_translation")
+        self.translation_provider_id: str = str(_get(config, "translation_provider_id") or "").strip()
+        self.enable_image_push: bool = _parse_bool(_get(config, "enable_image_push"), "enable_image_push")
 
 
         # 加载动态订阅配置
@@ -264,9 +313,8 @@ class LeetCodePlugin(Star):
         """加载动态订阅配置（群组订阅、个人订阅等运行时数据）"""
         # 初始化默认值
         self.subscribed_groups: list = []
-        self.inform_hour: int = 9
-        self.inform_minute: int = 0
-        self.check_interval_seconds: int = 3600
+        self.inform_hour: int = self.group_inform_hour
+        self.inform_minute: int = self.group_inform_minute
         self.group_origins: Dict[str, str] = {}
 
         # 加载订阅配置
@@ -383,7 +431,6 @@ class LeetCodePlugin(Star):
         if user_id in self.user_cron_jobs:
             await self._unregister_cron_for_user(user_id)
 
-        user_lang = self._get_user_language(user_id)
         hour, minute = self._get_user_push_time(user_id)
         cron_expression = f"{minute} {hour} * * *"
 
@@ -393,7 +440,7 @@ class LeetCodePlugin(Star):
                 user_id = kwargs.get("user_id")
                 question = await self._fetch_daily_question()
                 if question:
-                    text = self._build_question_message(question, kwargs.get("lang", self.default_language))
+                    text = self._build_question_message(question, self._get_user_language(user_id))
                     sent = await self._send_private_message(user_id, text, use_image=self.enable_image_push)
                     if sent:
                         logger.info(f"[CronJob] LeetCode每日一题已推送到用户 {user_id}")
@@ -409,7 +456,7 @@ class LeetCodePlugin(Star):
                 handler=handler,
                 description=f"LeetCode每日一题个人订阅: {user_id}",
                 timezone="Asia/Shanghai",
-                payload={"umo": umo, "lang": user_lang, "user_id": user_id},
+                payload={"umo": umo, "user_id": user_id},
                 enabled=True,
                 persistent=False,  # 重启后由插件重新注册
             )
@@ -500,10 +547,15 @@ class LeetCodePlugin(Star):
                     now = datetime.now()
                     today_date = now.strftime("%Y-%m-%d")
 
-                    # 检查群组订阅推送时间
-                    if (now.hour == self.inform_hour and
-                        now.minute == self.inform_minute and
-                        today_date != last_inform_date):
+                    target_time = now.replace(
+                        hour=self.inform_hour,
+                        minute=self.inform_minute,
+                        second=0,
+                        microsecond=0
+                    )
+
+                    # 到达群组推送时间后，当天未推送过就推送，避免启动延迟错过整分钟
+                    if now >= target_time and today_date != last_inform_date:
 
                         logger.info(f"开始获取 LeetCode 每日一题(群组): {today_date}")
                         question = await self._fetch_daily_question()
@@ -517,7 +569,7 @@ class LeetCodePlugin(Star):
                 except Exception as e:
                     logger.error(f"LeetCode 监控任务出错: {e}")
 
-                await asyncio.sleep(30)
+                await asyncio.sleep(self.check_interval_seconds)
 
         except asyncio.CancelledError:
             logger.info("LeetCode 每日一题监控任务已停止")

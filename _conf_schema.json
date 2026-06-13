@@ -5,6 +5,24 @@
     "hint": "可以管理插件的管理员用户ID列表",
     "default": []
   },
+  "group_inform_hour": {
+    "description": "群订阅推送时间（小时）",
+    "type": "int",
+    "hint": "群订阅每日一题推送小时，24小时制，范围 0-23",
+    "default": 9
+  },
+  "group_inform_minute": {
+    "description": "群订阅推送时间（分钟）",
+    "type": "int",
+    "hint": "群订阅每日一题推送分钟，范围 0-59",
+    "default": 0
+  },
+  "check_interval_seconds": {
+    "description": "群订阅检查间隔（秒）",
+    "type": "int",
+    "hint": "检查是否到达群推送时间的间隔，范围 5-3600 秒",
+    "default": 30
+  },
   "default_language": {
     "description": "默认题目语言",
     "type": "string",

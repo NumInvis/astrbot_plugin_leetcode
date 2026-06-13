@@ -40,6 +40,9 @@
 | 配置项 | 类型 | 说明 | 默认值 |
 |--------|------|------|--------|
 | `admin_users` | 列表 | 管理员用户ID列表 | `[]` |
+| `group_inform_hour` | 整数 | 群订阅推送时间（小时，0-23） | `9` |
+| `group_inform_minute` | 整数 | 群订阅推送时间（分钟，0-59） | `0` |
+| `check_interval_seconds` | 整数 | 群订阅推送检查间隔（5-3600秒） | `30` |
 | `default_language` | 字符串 | 默认题目语言（zh/en/both） | `zh` |
 | `enable_personal_subscribe` | 布尔 | 启用个人订阅功能 | `true` |
 | `personal_inform_hour` | 整数 | 个人订阅推送时间（小时） | `9` |
