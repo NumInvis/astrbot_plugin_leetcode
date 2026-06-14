@@ -4,5 +4,66 @@
     "type": "list",
     "hint": "可以管理插件的管理员用户ID列表",
     "default": []
+  },
+  "group_inform_hour": {
+    "description": "群订阅推送时间（小时）",
+    "type": "int",
+    "hint": "群订阅每日一题推送小时，24小时制，范围 0-23",
+    "default": 9
+  },
+  "group_inform_minute": {
+    "description": "群订阅推送时间（分钟）",
+    "type": "int",
+    "hint": "群订阅每日一题推送分钟，范围 0-59",
+    "default": 0
+  },
+  "check_interval_seconds": {
+    "description": "群订阅检查间隔（秒）",
+    "type": "int",
+    "hint": "检查是否到达群推送时间的间隔，范围 5-3600 秒",
+    "default": 30
+  },
+  "default_language": {
+    "description": "默认题目语言",
+    "type": "string",
+    "hint": "题目显示的语言：zh(中文)、en(英文)、both(双语)。注意：中文内容需要配置LLM提供商进行实时翻译",
+    "default": "zh",
+    "enum": ["zh", "en", "both"]
+  },
+  "enable_personal_subscribe": {
+    "description": "启用个人订阅功能",
+    "type": "bool",
+    "hint": "是否允许用户进行个人订阅（私信接收题目）",
+    "default": true
+  },
+  "personal_inform_hour": {
+    "description": "个人订阅推送时间（小时）",
+    "type": "int",
+    "hint": "个人订阅者接收题目的时间（0-23）",
+    "default": 9
+  },
+  "personal_inform_minute": {
+    "description": "个人订阅推送时间（分钟）",
+    "type": "int",
+    "hint": "个人订阅者接收题目的时间（0-59）",
+    "default": 30
+  },
+  "enable_llm_translation": {
+    "description": "启用大模型翻译中文",
+    "type": "bool",
+    "hint": "中文题目内容将通过大模型API实时翻译（需要配置LLM提供商）。关闭则仅显示英文内容。",
+    "default": true
+  },
+  "translation_provider_id": {
+    "description": "翻译专用LLM提供商ID（可选）",
+    "type": "string",
+    "hint": "指定用于翻译的LLM提供商ID，留空则使用AstrBot默认提供商",
+    "default": ""
+  },
+  "enable_image_push": {
+    "description": "推送时使用文转图（图片形式）",
+    "type": "bool",
+    "hint": "开启后，订阅推送将以图片形式发送。关闭则发送纯文本。",
+    "default": false
   }
 }

@@ -1,13 +1,16 @@
 name: astrbot_plugin_leetcode
 display_name: LeetCode每日亿题
-desc: LeetCode 每日一题提醒插件，定时推送每日一题
+desc: LeetCode 每日一题提醒插件，支持LLM翻译中文、个人订阅和AI解题
 help: |
   📢 LeetCode 每日一题提醒插件
 
   【功能】
-  定时获取 LeetCode 每日一题并推送到订阅的群组
+  • 定时推送 LeetCode 每日一题到订阅的群组
+  • 支持个人订阅，私信接收题目
+  • 多语言显示（中文/英文/双语）- 中文通过LLM实时翻译
+  • AI 智能解题分析
 
-  【命令】
+  【群组命令】
   /lc菜单 - 查看主菜单
   /lc帮助 - 查看详细帮助
   /lc订阅 - 在当前群订阅每日一题
@@ -15,7 +18,20 @@ help: |
   /lc今日 - 立即获取今日题目
   /lc列表 - 查看当前群的订阅状态
   /lc全部订阅 - 查看所有群的订阅
+  /lc题目 [题号] - 查询指定题目
+  /lc解题 [题号] - AI分析解答题目
 
-version: "1.0.0"
+  【个人命令（私聊）】
+  /lc订阅我 - 订阅私信推送
+  /lc退订我 - 取消个人订阅
+  /lc我的状态 - 查看个人订阅状态
+  /lc语言 [zh/en/both] - 设置显示语言
+  /lc今日 - 获取今日题目
+  /lc题目 [题号] - 查询指定题目
+  /lc解题 [题号] - AI分析解答题目
+
+  ⚠️ 注意：中文题目内容依赖大模型API实时翻译，请确保已配置LLM提供商
+
+version: "1.1.0"
 author: NumInvis
 repo: https://github.com/NumInvis/astrbot_plugin_leetcode
