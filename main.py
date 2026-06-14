@@ -1,4 +1,4 @@
-"""
+﻿"""
 LeetCode 每日一题提醒插件
 移植自 nonebot-plugin-leetcode
 版本: 1.1.0
@@ -110,6 +110,9 @@ class _LeetCodeHTMLToMarkdown(HTMLParser):
         if t == "pre":
             self._in_pre = True
             self._code_buf = []
+        elif self._in_pre:
+            if t == "br":
+                self._code_buf.append("\n")
         elif t == "code" and not self._in_pre:
             self._in_code = True
             self._code_buf = []
@@ -150,12 +153,15 @@ class _LeetCodeHTMLToMarkdown(HTMLParser):
         t = tag.lower()
         if t == "pre":
             self._in_pre = False
-            lang = self._code_lang or ""
-            self._result.append(f"\n```{lang}\n")
-            self._result.append("".join(self._code_buf).strip())
-            self._result.append("\n```\n")
+            code_text = "".join(self._code_buf).strip()
+            if code_text:
+                # AstrBot 的文本转图片主题可能会把 Markdown 代码块内容渲染为空，
+                # 示例区改用普通文本更稳定。
+                self._result.append(f"\n{code_text}\n")
             self._code_buf = []
             self._code_lang = ""
+        elif self._in_pre:
+            return
         elif t == "code" and not self._in_pre:
             self._in_code = False
             self._result.append("`")
@@ -184,12 +190,6 @@ class _LeetCodeHTMLToMarkdown(HTMLParser):
 
     def handle_data(self, data: str):
         text = data
-        # 在 <pre><code class="..."> 中提取语言标识
-        if self._in_pre and not self._code_buf and not self._code_lang:
-            stripped = text.strip()
-            if stripped:
-                # code 开头处的空白/换行直接跳过
-                return
         if self._in_pre:
             self._code_buf.append(text)
         elif self._in_code:
@@ -200,7 +200,11 @@ class _LeetCodeHTMLToMarkdown(HTMLParser):
 
     def handle_entityref(self, name: str):
         entities = {"quot": '"', "amp": "&", "lt": "<", "gt": ">", "nbsp": " ", "#39": "'"}
-        self._result.append(entities.get(name, f"&{name};"))
+        text = entities.get(name, f"&{name};")
+        if self._in_pre or self._in_code:
+            self._code_buf.append(text)
+        else:
+            self._result.append(text)
 
     def handle_charref(self, name: str):
         try:
@@ -208,9 +212,12 @@ class _LeetCodeHTMLToMarkdown(HTMLParser):
                 ch = chr(int(name[1:], 16))
             else:
                 ch = chr(int(name))
-            self._result.append(ch)
         except (ValueError, OverflowError):
-            self._result.append(f"&#{name};")
+            ch = f"&#{name};"
+        if self._in_pre or self._in_code:
+            self._code_buf.append(ch)
+        else:
+            self._result.append(ch)
 
     # ---- helpers ----
     def _maybe_newline(self):
@@ -337,6 +344,7 @@ class LeetCodePlugin(Star):
         # 调试日志：打印配置
         logger.info(f"[配置加载] enable_llm_translation: {self.enable_llm_translation}")
         logger.info(f"[配置加载] translation_provider_id: '{self.translation_provider_id}'")
+        logger.info(f"[配置加载] enable_image_push: {self.enable_image_push}")
 
     def _get_group_id(self, event: AstrMessageEvent) -> Optional[str]:
         """获取群组ID"""
@@ -422,10 +430,10 @@ class LeetCodePlugin(Star):
         custom_tag = "（自定义）" if is_custom else "（默认）"
         return f"{h:02d}:{m:02d} {custom_tag}"
 
-    async def _register_cron_for_user(self, user_id: str, umo: str):
+    async def _register_cron_for_user(self, user_id: str, umo: str) -> bool:
         """为指定用户注册 CronJob（Basic 模式）"""
         if not self.enable_personal_subscribe:
-            return
+            return False
 
         # 如果已存在，先取消旧的
         if user_id in self.user_cron_jobs:
@@ -462,8 +470,10 @@ class LeetCodePlugin(Star):
             )
             self.user_cron_jobs[user_id] = job.job_id
             logger.info(f"[CronJob] 已为用户 {user_id} 注册定时任务，执行时间: {cron_expression}")
+            return True
         except Exception as e:
             logger.error(f"[CronJob] 注册用户 {user_id} 的定时任务失败: {e}")
+            return False
 
     async def _unregister_cron_for_user(self, user_id: str):
         """取消指定用户的 CronJob"""
@@ -487,8 +497,8 @@ class LeetCodePlugin(Star):
         for user_id in self.subscribed_users:
             umo = self.user_origins.get(user_id)
             if umo:
-                await self._register_cron_for_user(user_id, umo)
-                restored_count += 1
+                if await self._register_cron_for_user(user_id, umo):
+                    restored_count += 1
                 await asyncio.sleep(0.1)  # 避免过快注册
             else:
                 logger.warning(f"[CronJob] 用户 {user_id} 缺少 UMO，跳过恢复")
@@ -575,113 +585,432 @@ class LeetCodePlugin(Star):
             logger.info("LeetCode 每日一题监控任务已停止")
 
     async def _fetch_daily_question(self, umo: str = None) -> Optional[Dict]:
-        """获取 LeetCode 每日一题 - 使用内置的 urllib，含自动重试
-        
-        Args:
-            umo: 统一消息来源标识，用于获取当前会话的LLM提供商（翻译用）
-        """
+        """获取 LeetCode 每日一题，优先使用 LeetCode CN 官方 GraphQL。"""
         import urllib.request
         import urllib.error
         import ssl
 
-        url = "https://leetcode-api-pied.vercel.app/daily"
-        logger.info(f"[每日一题] 开始获取，URL: {url}, umo: {umo}")
-
-        # 创建SSL上下文，忽略证书验证
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
-
-        # 使用线程池执行同步请求
         loop = asyncio.get_event_loop()
 
-        def fetch():
-            req = urllib.request.Request(
-                url,
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-            )
+        def http_request(url, post_data=None, headers=None):
+            request_headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            if headers:
+                request_headers.update(headers)
+
+            data = None
+            if post_data is not None:
+                data = json.dumps(post_data).encode('utf-8')
+                request_headers.setdefault('Content-Type', 'application/json')
+
+            req = urllib.request.Request(url, data=data, headers=request_headers)
             with urllib.request.urlopen(req, context=ssl_context, timeout=30) as response:
                 return response.read().decode('utf-8')
 
-        # 重试机制：最多重试 3 次，间隔 1s
-        max_retries = 3
-        last_error = None
-        for attempt in range(1, max_retries + 1):
+        async def fetch_with_retry(url, max_retries=3, post_data=None, headers=None, log_prefix="[每日一题]"):
+            last_error = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return await loop.run_in_executor(
+                        None,
+                        lambda u=url, p=post_data, h=headers: http_request(u, p, h)
+                    )
+                except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+                    last_error = e
+                    logger.warning(f"{log_prefix} 第 {attempt}/{max_retries} 次请求失败: {e}")
+                    if attempt < max_retries:
+                        await asyncio.sleep(1)
+            logger.error(f"{log_prefix} 获取失败（已重试 {max_retries} 次）: {last_error}", exc_info=True)
+            return None
+
+        def parse_ac_rate(value) -> float:
+            if value in (None, ""):
+                return 0
+            if isinstance(value, str):
+                value = value.strip()
+                if value.endswith("%"):
+                    value = value[:-1]
             try:
-                response_text = await loop.run_in_executor(None, fetch)
-                break
-            except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
-                last_error = e
-                logger.warning(f"[每日一题] 第 {attempt}/{max_retries} 次请求失败: {e}")
-                if attempt < max_retries:
-                    await asyncio.sleep(1)
-        else:
-            logger.error(f"[每日一题] 获取 LeetCode 每日一题失败（已重试 {max_retries} 次）: {last_error}", exc_info=True)
+                number = float(value)
+            except (TypeError, ValueError):
+                return 0
+            return number / 100.0 if number > 1 else number
+
+        async def fetch_from_leetcode_cn() -> Optional[Dict]:
+            url = "https://leetcode.cn/graphql/"
+            payload = {
+                "operationName": "questionOfToday",
+                "variables": {},
+                "query": """
+                query questionOfToday {
+                    todayRecord {
+                        date
+                        question {
+                            questionId
+                            questionFrontendId
+                            questionTitle
+                            questionTitleSlug
+                            translatedTitle
+                            content
+                            translatedContent
+                            difficulty
+                            topicTags {
+                                name
+                                slug
+                                translatedName
+                            }
+                            stats
+                        }
+                    }
+                }
+                """
+            }
+            headers = {
+                'Referer': 'https://leetcode.cn/problemset/'
+            }
+
+            logger.info(f"[每日一题] 开始获取 LeetCode CN 官方数据，URL: {url}, umo: {umo}")
+            response_text = await fetch_with_retry(
+                url,
+                post_data=payload,
+                headers=headers,
+                log_prefix="[每日一题] LeetCode CN"
+            )
+            if not response_text:
+                return None
+
+            try:
+                logger.info(f"[每日一题] LeetCode CN 原始响应: {response_text[:500]}...")
+                data = json.loads(response_text)
+                records = data.get("data", {}).get("todayRecord") or []
+                if not records:
+                    logger.warning("[每日一题] LeetCode CN 未返回 todayRecord")
+                    return None
+
+                record = records[0]
+                question = record.get("question") or {}
+                title_slug = question.get("questionTitleSlug") or ""
+                title = question.get("questionTitle") or ""
+                title_cn = question.get("translatedTitle") or title
+                content_html = question.get("content") or ""
+                content_cn = question.get("translatedContent") or ""
+
+                stats = {}
+                stats_raw = question.get("stats")
+                if isinstance(stats_raw, str) and stats_raw:
+                    try:
+                        stats = json.loads(stats_raw)
+                    except json.JSONDecodeError:
+                        logger.warning(f"[每日一题] LeetCode CN stats 解析失败: {stats_raw[:100]}")
+                elif isinstance(stats_raw, dict):
+                    stats = stats_raw
+
+                result = {
+                    "date": record.get("date"),
+                    "title": title,
+                    "titleCn": title_cn,
+                    "titleSlug": title_slug,
+                    "frontendQuestionId": question.get("questionFrontendId") or question.get("questionId"),
+                    "difficulty": question.get("difficulty"),
+                    "acRate": parse_ac_rate(stats.get("acRate")),
+                    "link": f"https://leetcode.com/problems/{title_slug}/" if title_slug else "",
+                    "topicTags": question.get("topicTags", []),
+                    "content": content_html,
+                    "contentCn": content_cn,
+                    "contentCnFailed": not bool(content_cn)
+                }
+
+                logger.info(
+                    f"[每日一题] LeetCode CN 获取成功 - 标题: {title_cn or title}, "
+                    f"content长度: {len(content_html)}, contentCn长度: {len(content_cn)}"
+                )
+                return result
+            except Exception as e:
+                logger.error(f"[每日一题] 解析 LeetCode CN 每日一题失败: {e}", exc_info=True)
+                return None
+
+        async def fetch_from_legacy_api() -> Optional[Dict]:
+            url = "https://leetcode-api-pied.vercel.app/daily"
+            logger.info(f"[每日一题] 开始获取旧版备用接口，URL: {url}, umo: {umo}")
+
+            response_text = await fetch_with_retry(url, log_prefix="[每日一题] 备用接口")
+            if not response_text:
+                return None
+
+            try:
+                logger.info(f"[每日一题] 备用接口原始响应: {response_text[:500]}...")
+
+                data = json.loads(response_text)
+                question = data.get("question", {})
+                link = data.get("link", "")
+                title_slug = question.get("titleSlug")
+
+                logger.info(f"[每日一题] 备用接口解析数据 - titleSlug: {title_slug}, link: {link}")
+
+                title = question.get("title", "")
+                content_html = question.get("content", "")
+                title_cn = ""
+                content_cn = ""
+                content_cn_failed = False
+
+                if self.enable_llm_translation and title_slug:
+                    logger.info(f"[每日一题] 备用接口准备使用大模型翻译，title_slug: {title_slug}, umo: {umo}")
+                    try:
+                        title_cn, content_cn, translation_success = await self._fetch_chinese_content(
+                            title_slug, title, content_html, umo=umo
+                        )
+                        if not translation_success:
+                            content_cn_failed = True
+                            logger.warning("[每日一题] 备用接口大模型翻译未完全成功")
+                    except Exception as e:
+                        logger.warning(f"[每日一题] 备用接口大模型翻译失败: {e}")
+                        content_cn_failed = True
+                else:
+                    logger.info("[每日一题] 备用接口大模型翻译已禁用或无 title_slug")
+                    content_cn_failed = True
+
+                if not title_cn:
+                    title_cn = title
+
+                result = {
+                    "date": data.get("date"),
+                    "title": title,
+                    "titleCn": title_cn,
+                    "titleSlug": title_slug,
+                    "frontendQuestionId": question.get("questionFrontendId"),
+                    "difficulty": question.get("difficulty"),
+                    "acRate": parse_ac_rate(question.get("acRate")),
+                    "link": f"https://leetcode.com{link}" if link.startswith("/") else link,
+                    "topicTags": question.get("topicTags", []),
+                    "content": content_html,
+                    "contentCn": content_cn,
+                    "contentCnFailed": content_cn_failed
+                }
+
+                logger.info(
+                    f"[每日一题] 备用接口获取成功 - 标题: {title_cn or title}, "
+                    f"content长度: {len(content_html) if content_html else 0}, "
+                    f"contentCn长度: {len(content_cn) if content_cn else 0}, 失败: {content_cn_failed}"
+                )
+                return result
+            except Exception as e:
+                logger.error(f"[每日一题] 解析备用接口每日一题失败: {e}", exc_info=True)
+                return None
+
+        question = await fetch_from_leetcode_cn()
+        if question:
+            return question
+
+        logger.warning("[每日一题] LeetCode CN 获取失败，尝试旧版备用接口")
+        return await fetch_from_legacy_api()
+
+    def _parse_ac_rate_value(self, value) -> float:
+        """解析 LeetCode 返回的通过率，统一为 0-1 的小数。"""
+        if value in (None, ""):
+            return 0
+        if isinstance(value, str):
+            value = value.strip()
+            if value.endswith("%"):
+                value = value[:-1]
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0
+        return number / 100.0 if number > 1 else number
+
+    def _build_cn_question_result(self, question: Dict, date: str = "") -> Dict:
+        """将 LeetCode CN GraphQL 的 question 对象转换为插件统一题目结构。"""
+        title_slug = question.get("questionTitleSlug") or question.get("titleSlug") or ""
+        title = question.get("questionTitle") or question.get("title") or ""
+        title_cn = question.get("translatedTitle") or question.get("titleCn") or title
+        content_html = question.get("content") or ""
+        content_cn = question.get("translatedContent") or ""
+
+        stats = {}
+        stats_raw = question.get("stats")
+        if isinstance(stats_raw, str) and stats_raw:
+            try:
+                stats = json.loads(stats_raw)
+            except json.JSONDecodeError:
+                logger.warning(f"[LeetCode CN] stats 解析失败: {stats_raw[:100]}")
+        elif isinstance(stats_raw, dict):
+            stats = stats_raw
+
+        return {
+            "date": date,
+            "title": title,
+            "titleCn": title_cn,
+            "titleSlug": title_slug,
+            "frontendQuestionId": question.get("questionFrontendId") or question.get("frontendQuestionId") or question.get("questionId"),
+            "difficulty": question.get("difficulty"),
+            "acRate": self._parse_ac_rate_value(stats.get("acRate") or question.get("acRate")),
+            "link": f"https://leetcode.com/problems/{title_slug}/" if title_slug else "",
+            "topicTags": question.get("topicTags", []),
+            "content": content_html,
+            "contentCn": content_cn,
+            "contentCnFailed": not bool(content_cn)
+        }
+
+    async def _fetch_random_question(self) -> Optional[Dict]:
+        """随机获取一道 LeetCode 题目，不使用每日一题缓存。"""
+        import random
+        import urllib.request
+        import urllib.error
+        import ssl
+
+        url = "https://leetcode.cn/graphql/"
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        loop = asyncio.get_event_loop()
+
+        def http_post(payload, referer="https://leetcode.cn/problemset/"):
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Content-Type": "application/json",
+                    "Referer": referer,
+                }
+            )
+            with urllib.request.urlopen(req, context=ssl_context, timeout=30) as response:
+                return response.read().decode("utf-8")
+
+        async def post_with_retry(payload, referer="https://leetcode.cn/problemset/", log_prefix="[随机题目]"):
+            last_error = None
+            for attempt in range(1, 4):
+                try:
+                    return await loop.run_in_executor(None, lambda: http_post(payload, referer))
+                except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+                    last_error = e
+                    logger.warning(f"{log_prefix} 第 {attempt}/3 次请求失败: {e}")
+                    if attempt < 3:
+                        await asyncio.sleep(1)
+            logger.error(f"{log_prefix} 请求失败（已重试 3 次）: {last_error}", exc_info=True)
+            return None
+
+        list_query = """
+        query problemsetQuestionList($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionListFilterInput) {
+            problemsetQuestionList(categorySlug: $categorySlug, limit: $limit, skip: $skip, filters: $filters) {
+                total
+                questions {
+                    frontendQuestionId
+                    title
+                    titleCn
+                    titleSlug
+                    difficulty
+                    acRate
+                    paidOnly
+                    topicTags {
+                        name
+                        slug
+                        nameTranslated
+                    }
+                }
+            }
+        }
+        """
+
+        detail_query = """
+        query questionData($titleSlug: String!) {
+            question(titleSlug: $titleSlug) {
+                questionId
+                questionFrontendId
+                questionTitle
+                questionTitleSlug
+                translatedTitle
+                content
+                translatedContent
+                difficulty
+                topicTags {
+                    name
+                    slug
+                    translatedName
+                }
+                stats
+            }
+        }
+        """
+
+        first_payload = {
+            "operationName": "problemsetQuestionList",
+            "variables": {"categorySlug": "", "skip": 0, "limit": 1, "filters": {}},
+            "query": list_query,
+        }
+        first_text = await post_with_retry(first_payload, log_prefix="[随机题目] 获取题库总数")
+        if not first_text:
             return None
 
         try:
-            logger.info(f"[每日一题] API 原始响应: {response_text[:500]}...")
-
-            data = json.loads(response_text)
-            question = data.get("question", {})
-            link = data.get("link", "")
-            title_slug = question.get("titleSlug")
-
-            logger.info(f"[每日一题] 解析数据 - titleSlug: {title_slug}, link: {link}")
-            logger.info(f"[每日一题] question 对象 keys: {list(question.keys())}")
-
-            # 获取标题和内容（英文）
-            title = question.get("title", "")
-            content_html = question.get("content", "")
-            logger.info(f"[每日一题] 英文内容 - 标题: {title}, 内容长度: {len(content_html) if content_html else 0}")
-
-            # 使用大模型翻译获取中文内容
-            title_cn = ""
-            content_cn = ""
-            content_cn_failed = False
-            
-            if self.enable_llm_translation and title_slug:
-                logger.info(f"[每日一题] 准备使用大模型翻译，title_slug: {title_slug}, umo: {umo}")
-                try:
-                    title_cn, content_cn, translation_success = await self._fetch_chinese_content(
-                        title_slug, title, content_html, umo=umo
-                    )
-                    if not translation_success:
-                        content_cn_failed = True
-                        logger.warning(f"[每日一题] 大模型翻译未完全成功")
-                except Exception as e:
-                    logger.warning(f"[每日一题] 大模型翻译失败: {e}")
-                    content_cn_failed = True
-            else:
-                logger.info(f"[每日一题] 大模型翻译已禁用或无title_slug，使用英文内容")
-                content_cn_failed = True
-            
-            # 如果没有翻译成功，使用英文作为后备
-            if not title_cn:
-                title_cn = title
-
-            result = {
-                "date": data.get("date"),
-                "title": title,
-                "titleCn": title_cn,
-                "titleSlug": title_slug,
-                "frontendQuestionId": question.get("questionFrontendId"),
-                "difficulty": question.get("difficulty"),
-                "acRate": question.get("acRate", 0) / 100.0 if question.get("acRate") else 0,
-                "link": f"https://leetcode.com{link}" if link.startswith("/") else link,
-                "topicTags": question.get("topicTags", []),
-                "content": content_html,
-                "contentCn": content_cn,
-                "contentCnFailed": content_cn_failed
-            }
-
-            logger.info(f"[每日一题] 最终结果 - 标题: {title_cn or title}, content长度: {len(content_html) if content_html else 0}, contentCn长度: {len(content_cn) if content_cn else 0}, 失败: {content_cn_failed}")
-            return result
+            first_data = json.loads(first_text)
+            total = int(first_data.get("data", {}).get("problemsetQuestionList", {}).get("total") or 0)
         except Exception as e:
-            logger.error(f"[每日一题] 获取 LeetCode 每日一题失败: {e}", exc_info=True)
+            logger.error(f"[随机题目] 解析题库总数失败: {e}", exc_info=True)
+            return None
 
+        if total <= 0:
+            logger.error("[随机题目] 题库总数为空")
+            return None
+
+        for attempt in range(1, 6):
+            skip = random.randint(0, total - 1)
+            list_payload = {
+                "operationName": "problemsetQuestionList",
+                "variables": {"categorySlug": "", "skip": skip, "limit": 1, "filters": {}},
+                "query": list_query,
+            }
+            list_text = await post_with_retry(list_payload, log_prefix=f"[随机题目] 抽取题目 {attempt}/5")
+            if not list_text:
+                continue
+
+            try:
+                list_data = json.loads(list_text)
+                questions = list_data.get("data", {}).get("problemsetQuestionList", {}).get("questions") or []
+                if not questions:
+                    logger.warning(f"[随机题目] skip={skip} 未返回题目")
+                    continue
+
+                light_question = questions[0]
+                if light_question.get("paidOnly"):
+                    logger.info(f"[随机题目] 抽到会员题，跳过: {light_question.get('titleSlug')}")
+                    continue
+
+                title_slug = light_question.get("titleSlug")
+                if not title_slug:
+                    logger.warning(f"[随机题目] 未获取到 titleSlug: {light_question}")
+                    continue
+
+                detail_payload = {
+                    "operationName": "questionData",
+                    "variables": {"titleSlug": title_slug},
+                    "query": detail_query,
+                }
+                detail_text = await post_with_retry(
+                    detail_payload,
+                    referer=f"https://leetcode.cn/problems/{title_slug}/",
+                    log_prefix=f"[随机题目] 获取详情 {title_slug}"
+                )
+                if not detail_text:
+                    continue
+
+                detail_data = json.loads(detail_text)
+                question = detail_data.get("data", {}).get("question") or {}
+                if not question:
+                    logger.warning(f"[随机题目] 详情为空: {title_slug}")
+                    continue
+
+                result = self._build_cn_question_result(question, date="随机题目")
+                logger.info(f"[随机题目] 获取成功: {result.get('frontendQuestionId')}. {result.get('titleCn') or result.get('title')}")
+                return result
+            except Exception as e:
+                logger.warning(f"[随机题目] 第 {attempt}/5 次解析失败: {e}", exc_info=True)
+
+        logger.error("[随机题目] 多次抽取均失败")
         return None
 
     async def _translate_with_llm(self, title: str, content: str, is_title: bool = False, umo: str = None) -> str:
@@ -1013,7 +1342,7 @@ class LeetCodePlugin(Star):
         tags = []
         for tag in question.get("topicTags", []):
             if isinstance(tag, dict):
-                tag_name = tag.get("nameTranslated") or tag.get("name", "")
+                tag_name = tag.get("translatedName") or tag.get("nameTranslated") or tag.get("name", "")
                 if tag_name:
                     tags.append(tag_name)
             else:
@@ -1127,13 +1456,14 @@ class LeetCodePlugin(Star):
     async def _send_question_to_subscribers(self, question: Dict):
         """发送题目到所有群组订阅者"""
         text = self._build_question_message(question, self.default_language)
+        image_chain = None
+        if self.enable_image_push:
+            image_chain = await self._text_to_image_chain(text)
 
         for group_id in self.subscribed_groups:
             try:
-                await self.context.send_message(
-                    self._get_session_for_group(group_id),
-                    text
-                )
+                message = image_chain if image_chain else text
+                await self.context.send_message(self._get_session_for_group(group_id), message)
                 logger.info(f"LeetCode 每日一题已发送到群 {group_id}")
                 await asyncio.sleep(1)
             except Exception as e:
@@ -1183,10 +1513,13 @@ class LeetCodePlugin(Star):
         import random
 
         sent = False
+        sent_as_image = False
         is_qq_num = self._is_qq_number(user_id)
         is_openid = self._is_openid(user_id)
+        umo = self.user_origins.get(user_id)
 
         # 如果启用文转图，先尝试渲染图片
+        image_chain = None
         image_file = None
         if use_image:
             try:
@@ -1194,11 +1527,32 @@ class LeetCodePlugin(Star):
                 from astrbot.core.message.components import Plain
                 first = chain.chain[0]
                 if not isinstance(first, Plain):
-                    image_file = first.file  # Image 组件的 file 属性
+                    image_chain = chain
+                    image_file = getattr(chain, "_leetcode_image_path", None)
+                    if not image_file:
+                        image_file = getattr(first, "file", None) or getattr(first, "path", None)
+                    if isinstance(image_file, str) and image_file.startswith("file:"):
+                        image_file = image_file[5:]
             except Exception as e:
                 logger.warning(f"[私信发送] 文转图失败，回退纯文本: {e}")
 
-        logger.info(f"[私信发送] 开始发送 user={user_id}, 类型={'QQ号' if is_qq_num else 'openid' if is_openid else '其他平台'}, 文转图={'是' if use_image else '否'}")
+        logger.info(
+            f"[私信发送] 开始发送 user={user_id}, "
+            f"类型={'QQ号' if is_qq_num else 'openid' if is_openid else '其他平台'}, "
+            f"文转图={'是' if use_image else '否'}, 图片={'已生成' if image_chain else '未生成'}"
+        )
+
+        # 开启图片推送时优先使用 AstrBot 框架发送 MessageChain，和 /lc今日 的发送方式保持一致。
+        if use_image and image_chain and umo:
+            try:
+                sent = await self.context.send_message(umo, image_chain)
+                if sent:
+                    logger.info(f"[私信发送] 框架图片发送成功 user={user_id}")
+                    setattr(self, "_last_private_send_as_image", True)
+                    return True
+                logger.warning(f"[私信发送] 框架图片发送未成功，尝试底层API兜底 user={user_id}")
+            except Exception as e:
+                logger.warning(f"[私信发送] 框架图片发送失败，尝试底层API兜底 user={user_id}: {e}")
 
         # 策略1 & 2: QQ 系平台使用底层 API（绕过框架高层 API 的限制）
         if is_qq_num or is_openid:
@@ -1216,6 +1570,7 @@ class LeetCodePlugin(Star):
                             msg_list = [{"type": "text", "data": {"text": text}}]
                         await bot.send_private_msg(user_id=int(user_id), message=msg_list)
                         sent = True
+                        sent_as_image = bool(image_file)
                         logger.info(f"[私信发送] aiocqhttp发送成功 user_id={user_id}")
                         break
 
@@ -1258,6 +1613,7 @@ class LeetCodePlugin(Star):
                             if result is None:
                                 continue
                         sent = True
+                        sent_as_image = bool(image_file)
                         logger.info(f"[私信发送] qq_official发送成功 user_openid={user_id}")
                         break
                 except Exception as e:
@@ -1266,7 +1622,6 @@ class LeetCodePlugin(Star):
 
         # 策略3: 通用兜底 — 通过框架 context.send_message 发送（适用于飞书、Telegram、Discord 等）
         if not sent:
-            umo = self.user_origins.get(user_id)
             if umo:
                 try:
                     from astrbot.core.message.message_event_result import MessageChain
@@ -1276,15 +1631,28 @@ class LeetCodePlugin(Star):
                     else:
                         chain = MessageChain(chain=[Plain(text)])
                     sent = await self.context.send_message(umo, chain)
+                    sent_as_image = bool(use_image and image_file)
                     if sent:
                         logger.info(f"[私信发送] 通用兜底发送成功 user={user_id}")
                     else:
                         logger.warning(f"[私信发送] 通用兜底未找到匹配平台 user={user_id}")
                 except Exception as e:
                     logger.error(f"[私信发送] 通用兜底发送失败 user={user_id}: {e}")
+                    if use_image:
+                        try:
+                            text_chain = MessageChain(chain=[Plain(text)])
+                            sent = await self.context.send_message(umo, text_chain)
+                            sent_as_image = False
+                            if sent:
+                                logger.info(f"[私信发送] 图片失败后已降级纯文本发送成功 user={user_id}")
+                            else:
+                                logger.warning(f"[私信发送] 图片失败后降级纯文本仍未成功 user={user_id}")
+                        except Exception as text_error:
+                            logger.error(f"[私信发送] 图片失败后降级纯文本发送失败 user={user_id}: {text_error}")
             else:
                 logger.error(f"[私信发送] 所有策略均失败 user={user_id}（未找到该用户的平台会话记录）")
 
+        setattr(self, "_last_private_send_as_image", bool(sent and sent_as_image))
         return sent
 
     async def _text_to_image_chain(self, text: str):
@@ -1296,7 +1664,9 @@ class LeetCodePlugin(Star):
             image_path = await html_renderer.render_t2i(text, return_url=False)
             if image_path:
                 logger.info(f"[文转图] 渲染成功: {image_path}")
-                return MessageChain(chain=[Image.fromFileSystem(image_path)])
+                chain = MessageChain(chain=[Image.fromFileSystem(image_path)])
+                setattr(chain, "_leetcode_image_path", image_path)
+                return chain
         except Exception as e:
             logger.warning(f"[文转图] 渲染失败，回退纯文本: {e}")
         return MessageChain(chain=[Plain(text)])
@@ -1315,7 +1685,7 @@ class LeetCodePlugin(Star):
                 user_lang = self._get_user_language(user_id)
                 text = self._build_question_message(question, user_lang)
                 
-                sent = await self._send_private_message(user_id, text)
+                sent = await self._send_private_message(user_id, text, use_image=self.enable_image_push)
                 if sent:
                     logger.info(f"LeetCode 每日一题已发送到用户 {user_id}")
                 else:
@@ -1337,54 +1707,42 @@ class LeetCodePlugin(Star):
     @filter.command("lc菜单")
     async def cmd_menu(self, event: AstrMessageEvent):
         """显示主菜单"""
-        self._save_group_origin(event)
-
-        # 判断当前是群聊还是私聊
         group_id = self._get_group_id(event)
-        
-        if group_id:
-            # 群聊环境 - 需要管理员权限
-            if not self._is_admin(event):
-                yield event.plain_result("⚠️ 只有管理员可以使用此命令")
-                return
+        if group_id and not self._is_admin(event):
+            yield event.plain_result("⚠️ 只有管理员可以使用此命令")
+            return
 
-            msg = """🤖 LeetCode 每日一题 - 主菜单
+        if group_id:
+            self._save_group_origin(event)
+        else:
+            self._save_user_origin(event)
+
+        msg = """🤖 LeetCode 每日一题 - 命令菜单
 
 【查询命令】
 📋 /lc今日 - 立即获取今日题目（含完整描述）
+🎲 /lc随机 - 随机获取一道题目（不使用今日缓存）
 🔍 /lc题目 [题号] - 查询指定题目（如: /lc题目 1）
 🤖 /lc解题 [题号] - 使用AI分析并解答题目（如: /lc解题 1）
-📋 /lc列表 - 查看当前群订阅状态
-
-【管理命令】
-➕ /lc订阅 - 在当前群订阅每日一题
-➖ /lc退订 - 在当前群取消订阅
-📋 /lc全部订阅 - 查看所有群的订阅
 📖 /lc帮助 - 查看详细帮助
 
-⚠️ 注意：中文题目内容依赖大模型API实时翻译，请确保已配置LLM提供商"""
-        else:
-            # 私聊环境 - 个人订阅功能
-            msg = """🤖 LeetCode 每日一题 - 个人菜单
+【群聊订阅】（群聊管理员）
+➕ /lc订阅 - 在当前群订阅每日一题
+➖ /lc退订 - 在当前群取消订阅
+📋 /lc列表 - 查看当前群订阅状态
+📋 /lc全部订阅 - 查看所有群订阅
 
-【查询命令】
-📋 /lc今日 - 立即获取今日题目（含完整描述）
-🔍 /lc题目 [题号] - 查询指定题目（如: /lc题目 1）
-🤖 /lc解题 [题号] - 使用AI分析并解答题目（如: /lc解题 1）
-
-【个人订阅】
+【个人订阅】（私聊）
 ➕ /lc订阅我 - 订阅每日一题私信推送
 ➖ /lc退订我 - 取消个人订阅
 📋 /lc我的状态 - 查看个人订阅状态
 ⏰ /lc时间 [HH:MM] - 设置推送时间（如: /lc时间 8:00）
-
-【语言设置】
 🌐 /lc语言 [zh/en/both] - 设置题目显示语言
-   示例: /lc语言 zh (仅中文)
-   示例: /lc语言 en (仅英文)
-   示例: /lc语言 both (双语显示)
+🧪 /lc测试推送 - 立即测试个人推送
 
-📖 /lc帮助 - 查看详细帮助
+【管理员命令】
+📋 /lc全部个人订阅 - 查看所有个人订阅
+🧪 /lc测试订阅 [用户ID] [--add] - 测试个人订阅推送
 
 ⚠️ 注意：中文题目内容依赖大模型API实时翻译，请确保已配置LLM提供商"""
 
@@ -1406,77 +1764,57 @@ class LeetCodePlugin(Star):
         else:
             self._save_user_origin(event)
 
-        if group_id:
-            # 群聊帮助
-            msg = """📖 LeetCode 每日一题 - 群组使用说明
+        msg = """📖 LeetCode 每日一题 - 完整使用说明
 
 【查询命令】
-1️⃣ /lc今日 - 立即获取并显示今日题目（含完整描述）
-2️⃣ /lc题目 [题号] - 查询指定题号的题目
+0. /lc菜单 - 显示简版命令菜单
+1. /lc今日 - 立即获取并显示今日题目
+2. /lc随机 - 随机获取一道题目，不使用今日题目缓存
+3. /lc题目 [题号] - 查询指定题号的题目
    示例: /lc题目 1 (查询两数之和)
-   示例: /lc题目  (不传参数则获取今日题目)
-3️⃣ /lc解题 [题号] - 使用AI分析题目并提供解题思路、代码和关键点
-   示例: /lc解题 1 (AI解答两数之和)
-   示例: /lc解题  (不传参数则解答今日题目)
-4️⃣ /lc列表 - 查看当前群是否已订阅
-
-【管理命令】
-5️⃣ /lc订阅 - 在当前群订阅每日一题推送
-6️⃣ /lc退订 - 在当前群取消每日一题推送
-7️⃣ /lc全部订阅 - 查看所有群的订阅情况（超级管理员）
-
-【AI解题说明】
-/lc解题命令需要AstrBot已配置LLM提供商（如OpenAI、Claude等）
-AI会提供：题目理解、解题思路、算法步骤、参考代码、关键点
-
-【个人订阅】
-私聊我还可以使用个人订阅功能:
-• /lc订阅我 - 私信接收每日题目
-• /lc时间 [HH:MM] - 自定义推送时间
-• /lc语言 - 设置题目显示语言
-
-【配置】
-- 默认每日 09:00 推送
-- 可在插件配置中修改推送时间
-
-【重要提示】
-⚠️ 中文题目内容依赖大模型API实时翻译
-- 请确保AstrBot已配置LLM提供商
-- 翻译功能可在配置中开启/关闭
-- 如翻译失败将显示英文内容"""
-        else:
-            # 私聊帮助
-            msg = """📖 LeetCode 每日一题 - 个人使用说明
-
-【查询命令】
-1️⃣ /lc今日 - 立即获取并显示今日题目
-2️⃣ /lc题目 [题号] - 查询指定题号的题目
-   示例: /lc题目 1 (查询两数之和)
-3️⃣ /lc解题 [题号] - 使用AI分析题目并提供解题思路
+4. /lc解题 [题号] - 使用AI分析题目并提供解题思路
    示例: /lc解题 1 (AI解答两数之和)
 
-【个人订阅命令】
-4️⃣ /lc订阅我 - 订阅每日一题私信推送
+【群聊订阅命令】（群聊管理员）
+5. /lc订阅 - 在当前群订阅每日一题推送
+6. /lc退订 - 在当前群取消每日一题推送
+7. /lc列表 - 查看当前群是否已订阅
+8. /lc全部订阅 - 查看所有群订阅情况
+
+【个人订阅命令】（私聊）
+9. /lc订阅我 - 订阅每日一题私信推送
    每天会自动收到题目推送
-5️⃣ /lc退订我 - 取消个人订阅
-6️⃣ /lc我的状态 - 查看订阅状态和语言设置
-7️⃣ /lc时间 [HH:MM] - 设置推送时间
+10. /lc退订我 - 取消个人订阅
+11. /lc我的状态 - 查看订阅状态和语言设置
+12. /lc时间 [HH:MM] - 设置推送时间
    示例: /lc时间 8:00
    示例: /lc时间 默认 (恢复默认时间)
 
 【语言设置】
-8️⃣ /lc语言 [zh/en/both] - 设置题目显示语言
-   • zh   - 仅中文
-   • en   - 仅英文
-   • both - 双语显示
+13. /lc语言 [zh/en/both] - 设置题目显示语言
+   - zh   - 仅中文
+   - en   - 仅英文
+   - both - 双语显示
    示例: /lc语言 zh
+
+【管理员命令】
+14. /lc全部个人订阅 - 查看所有个人订阅用户
+15. /lc测试订阅 [用户ID] [--add] - 测试给指定用户推送
+
+【测试命令】
+16. /lc测试推送 - 私聊中立即给自己发送一次每日一题，用于确认推送通道
 
 【AI解题说明】
 /lc解题命令需要AstrBot已配置LLM提供商
 AI会提供：题目理解、解题思路、算法步骤、参考代码、关键点
 
+【配置说明】
+- 群推送时间: group_inform_hour / group_inform_minute
+- 个人默认推送时间: personal_inform_hour / personal_inform_minute
+- 用户可通过 /lc时间 单独覆盖个人推送时间
+
 【重要提示】
-⚠️ 中文题目内容依赖大模型API实时翻译
+中文题目内容依赖大模型API实时翻译
 - 请确保AstrBot已配置LLM提供商
 - 翻译功能可在配置中开启/关闭
 - 如翻译失败将显示英文内容
@@ -1578,6 +1916,38 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
         else:
             yield event.plain_result(text)
 
+    @filter.command("lc随机")
+    async def cmd_random_question(self, event: AstrMessageEvent):
+        """随机获取一道题目，不使用今日题目缓存"""
+        group_id = self._get_group_id(event)
+        user_id = self._get_user_id(event)
+
+        # 群聊需要管理员权限，私聊无需权限
+        if group_id and not self._is_admin(event):
+            yield event.plain_result("⚠️ 只有管理员可以使用此命令")
+            return
+
+        if group_id:
+            self._save_group_origin(event)
+        else:
+            self._save_user_origin(event)
+
+        yield event.plain_result("⏳ 正在随机获取一道题目...")
+        question = await self._fetch_random_question()
+        if not question:
+            yield event.plain_result("❌ 随机题目获取失败，请稍后再试")
+            return
+
+        language = self.default_language if group_id else self._get_user_language(user_id)
+        text = self._build_question_message(question, language)
+
+        from astrbot.core.message.message_event_result import MessageEventResult
+        if self.enable_image_push:
+            chain = await self._text_to_image_chain(text)
+            yield MessageEventResult(chain=chain.chain)
+        else:
+            yield event.plain_result(text)
+
     @filter.command("lc列表")
     async def cmd_list(self, event: AstrMessageEvent):
         """查看当前群订阅状态"""
@@ -1670,11 +2040,12 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
           /lc时间 22:30    - 设置推送时间为 22:30
           /lc时间 默认     - 恢复使用配置文件默认时间
         """
-        user_id = self._get_user_id(event)
-
         if self._get_group_id(event):
             yield event.plain_result("❌ 此命令只能在私聊中使用\n请直接私信我发送 /lc时间")
             return
+
+        self._save_user_origin(event)
+        user_id = self._get_user_id(event)
 
         # 无参数 → 查看当前推送时间
         if not time_str.strip():
@@ -1697,7 +2068,9 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
             if user_id in self.subscribed_users:
                 umo = self.user_origins.get(user_id)
                 if umo:
-                    await self._register_cron_for_user(user_id, umo)
+                    if not await self._register_cron_for_user(user_id, umo):
+                        yield event.plain_result("⚠️ 已恢复默认时间，但定时任务注册失败，请查看 AstrBot 日志")
+                        return
             yield event.plain_result(
                 f"✅ 已恢复为默认推送时间: {self.personal_inform_hour:02d}:{self.personal_inform_minute:02d}"
             )
@@ -1726,11 +2099,17 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
         if user_id in self.subscribed_users:
             umo = self.user_origins.get(user_id)
             if umo:
-                await self._register_cron_for_user(user_id, umo)
+                if not await self._register_cron_for_user(user_id, umo):
+                    yield event.plain_result("⚠️ 已保存时间，但定时任务注册失败，请查看 AstrBot 日志")
+                    return
+            else:
+                yield event.plain_result("⚠️ 已保存时间，但缺少私聊会话记录，请重新发送 /lc订阅我 后再试")
+                return
 
         yield event.plain_result(
             f"✅ 推送时间已设置为: {hour:02d}:{minute:02d}\n"
-            f"下次推送将按此时间执行。"
+            f"下次推送将按此时间执行。\n"
+            f"注意：这是每天 {hour:02d}:{minute:02d} 推送，不是 {hour} 小时 {minute} 分钟后推送。"
         )
 
     # ========== 个人订阅管理命令 ==========
@@ -1762,7 +2141,9 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
         await self._save_personal_subscription()
 
         # 注册 CronJob
-        await self._register_cron_for_user(user_id, umo)
+        if not await self._register_cron_for_user(user_id, umo):
+            yield event.plain_result("⚠️ 订阅已保存，但定时任务注册失败，请查看 AstrBot 日志")
+            return
 
         yield event.plain_result(
             f"✅ 订阅成功！\n\n"
@@ -1772,7 +2153,8 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
             f"• /lc时间 - 设置推送时间\n"
             f"• /lc语言 - 设置题目显示语言\n"
             f"• /lc退订我 - 取消订阅\n"
-            f"• /lc今日 - 立即获取今日题目"
+            f"• /lc今日 - 立即获取今日题目\n"
+            f"• /lc随机 - 随机获取一道题目"
         )
 
     @filter.command("lc退订我")
@@ -1835,8 +2217,43 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
         lines.append("• /lc时间 [HH:MM] - 设置推送时间")
         lines.append("• /lc语言 [zh/en/both] - 设置语言")
         lines.append("• /lc今日 - 获取今日题目")
+        lines.append("• /lc随机 - 随机获取一道题目")
 
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("lc测试推送")
+    async def cmd_test_my_push(self, event: AstrMessageEvent):
+        """私聊中测试给自己推送每日一题"""
+        if self._get_group_id(event):
+            yield event.plain_result("❌ 此命令只能在私聊中使用\n请直接私信我发送 /lc测试推送")
+            return
+
+        self._save_user_origin(event)
+        user_id = self._get_user_id(event)
+        language = self._get_user_language(user_id)
+
+        today_date = datetime.now().strftime("%Y-%m-%d")
+        if self.today_question and self.today_date == today_date:
+            question = self.today_question
+        else:
+            yield event.plain_result("⏳ 正在获取今日题目并测试推送...")
+            question = await self._fetch_daily_question(umo=getattr(event, "unified_msg_origin", None))
+            if question:
+                self.today_question = question
+                self.today_date = today_date
+
+        if not question:
+            yield event.plain_result("❌ 获取今日题目失败，无法测试推送")
+            return
+
+        text = self._build_question_message(question, language)
+        sent = await self._send_private_message(user_id, text, use_image=self.enable_image_push)
+        if sent:
+            mode = "图片" if self.enable_image_push else "文本"
+            actual = "图片" if getattr(self, "_last_private_send_as_image", False) else "文本"
+            yield event.plain_result(f"✅ 测试推送成功，配置模式: {mode}，实际发送: {actual}")
+        else:
+            yield event.plain_result("❌ 测试推送失败，请查看 AstrBot 日志中的 [私信发送] 记录")
 
     @filter.command("lc全部个人订阅")
     async def cmd_all_personal_subscriptions(self, event: AstrMessageEvent):
@@ -2119,3 +2536,4 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
         except Exception as e:
             logger.error(f"AI解题失败: {e}", exc_info=True)
             yield event.plain_result(f"❌ AI解题失败: {e}\n请检查是否已配置LLM提供商")
+
