@@ -32,21 +32,49 @@
 
 ## ⚙️ 配置
 
-在 AstrBot 插件配置面板中设置：
+### 可视化设置页面
+
+在 AstrBot WebUI 中打开「插件」→ 本插件详情 →「每日一题设置」。需要使用支持插件可视化视图的 AstrBot 版本。
+
+- **每日推送时间**：默认 `09:00`，使用运行 AstrBot 的服务器或容器本地时间，所有订阅群共用。
+- **插件管理员**：支持批量填写用户 ID，使用换行、逗号或空格分隔，自动去重。AstrBot 管理员始终保留权限。
+- **检查间隔**：高级设置，默认 30 秒，可设为 5–30 秒。推送可能有一个检查间隔及获取题目所需的延迟。
+- **运行概览**：查看定时任务状态、服务器时间与时区、下次计划推送时间以及已订阅群组。
+
+点击「保存配置」后立即生效，无需重启。保存失败时会保留表单修改，便于重试。「撤销修改」恢复到最近一次加载或保存的配置；「刷新状态」保留当前表单内容。
+
+页面通过 AstrBot 自动注入的 `AstrBotPluginView` Bridge 读写配置，采用 LeetCode 橙色与中性色，跟随 WebUI 深浅色模式，适配窄屏。前端资源均随插件提供，无需安装 Node.js 或构建前端。
+
+当天已成功推送后，修改时间不会在当天重复推送。插件停止期间错过的推送不补发；重启插件会重置当天推送记录。
+
+### 普通配置面板
+
+也可在 AstrBot 插件配置面板中修改以下字段，保存后按面板提示重载插件：
 
 | 配置项 | 类型 | 说明 | 默认值 |
 |--------|------|------|--------|
 | `admin_users` | 列表 | 管理员用户ID列表 | `[]` |
+| `leetcode_inform_hour` | 整数 | 每日推送小时，0–23 | `9` |
+| `leetcode_inform_minute` | 整数 | 每日推送分钟，0–59 | `0` |
+| `leetcode_check_interval_seconds` | 整数 | 检查间隔，5–30 秒 | `30` |
 
 ### 配置管理员
 
-在 AstrBot 配置文件中添加管理员用户ID：
+在本插件配置中添加管理员用户 ID：
 
 ```json
 {
   "admin_users": ["123456789", "987654321"]
 }
 ```
+
+### 旧配置兼容
+
+首次加载时会迁移插件数据目录 `config.json` 中的 `inform_hour`、`inform_minute`、`check_interval_seconds` 和 `admin_users`。已有的非默认 AstrBot 配置优先保留；迁移后统一保存到 AstrBot 插件配置，后续以该配置为准。旧版无效或超过范围的检查间隔会恢复为 30 秒。
+
+如果插件未获得 `AstrBotConfig`，可视化页面会继续使用数据目录下的 `config.json` 保存设置。订阅列表仍由 `/lc订阅`、`/lc退订` 管理，保存在 `subscription.json` 中。
+
+实现依据：[独立插件页面](https://docs.astrbot.app/dev/star/guides/plugin-views/plugin-page.html)、[共享 Bridge API](https://docs.astrbot.app/dev/star/guides/plugin-views/bridge.html)、[后端 Web API](https://docs.astrbot.app/dev/star/guides/plugin-views/web-api.html)。
 
 ## 📖 使用指南
 

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>每日一题设置 · LeetCode</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="page-header">
+        <div class="identity"><span class="brand" aria-hidden="true"><svg viewBox="0 0 32 36" fill="none"><path d="M20 3 6 17a7 7 0 0 0 0 10l4 4a7 7 0 0 0 10 0l4-4" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="m12 11 3-3a6 6 0 0 1 8 0l4 4" stroke="#ffa116" stroke-width="4" stroke-linecap="round"/><path d="M14 22h16" stroke="#a3a3a3" stroke-width="4" stroke-linecap="round"/></svg></span><span>LeetCode <span class="identity-label">每日一题</span></span></div>
+        <span id="connection" class="connection">正在连接 AstrBot…</span>
+      </header>
+
+      <div class="intro">
+        <p class="eyebrow"><span class="challenge-dot"></span> DAILY CHALLENGE</p>
+        <h1>每日一题设置</h1>
+        <p class="subtitle">设置每日推送时间，让订阅群在合适的时刻收到新题。</p>
+      </div>
+
+      <div id="feedback" class="feedback" role="status" aria-live="polite" hidden></div>
+
+      <form id="settings-form">
+        <fieldset id="fields" disabled>
+          <div class="layout">
+            <div class="settings-column">
+              <section class="card">
+                <div class="section-heading"><span class="step">01</span><div><h2>每日推送</h2><p>所有订阅群共用同一个时间</p></div></div>
+                <div class="time-row">
+                  <div class="control"><label for="inform-time">推送时间</label><input id="inform-time" name="inform-time" type="time" step="60" value="09:00" required /><span class="hint">采用服务器本地时间</span></div>
+                  <div class="schedule-preview"><span class="preview-label">每天</span><strong id="time-preview">09:00</strong><span class="hint">自动获取并推送当日题目</span></div>
+                </div>
+                <p class="note">时间修改后立即生效。当天已推送过的题目不会因修改时间重复推送。</p>
+              </section>
+
+              <section class="card">
+                <div class="section-heading"><span class="step">02</span><div><h2>插件管理员</h2><p>允许这些用户使用查询、订阅和 AI 解题命令</p></div></div>
+                <label for="admin-users">管理员用户 ID <span id="admin-count" class="small-badge">0 人</span></label>
+                <textarea id="admin-users" name="admin-users" rows="4" placeholder="每行填写一个用户 ID，例如：&#10;123456789&#10;987654321" spellcheck="false" aria-describedby="admin-hint"></textarea>
+                <p id="admin-hint" class="hint">支持换行、逗号或空格分隔，重复 ID 会自动合并。留空时仅 AstrBot 管理员可使用命令。</p>
+              </section>
+
+              <details class="card advanced">
+                <summary><span>高级设置</span><span class="hint">定时检查间隔</span></summary>
+                <div class="advanced-content"><label for="check-interval">检查间隔（秒）</label><input id="check-interval" name="check-interval" type="number" min="5" max="30" step="1" value="30" required /><p class="hint">允许 5–30 秒，默认 30 秒。实际推送可能有一个检查间隔及题目获取所需的延迟。</p></div>
+              </details>
+            </div>
+
+            <aside class="status-column" aria-label="运行状态">
+              <section class="card runtime-card">
+                <div class="card-top"><h2>运行概览</h2><button id="refresh" type="button" class="text-button">刷新状态</button></div>
+                <div class="monitor-line"><span id="monitor-dot" class="dot"></span><strong id="monitor-status">正在读取状态</strong></div>
+                <dl class="runtime-list">
+                  <div><dt>下次计划推送</dt><dd id="next-run">—</dd></div>
+                  <div><dt>服务器时间</dt><dd id="server-time">—</dd></div>
+                  <div><dt>服务器时区</dt><dd id="server-timezone">—</dd></div>
+                </dl>
+                <p class="hint">服务器时间为最近一次读取的快照。计划时间根据已保存配置计算。</p>
+              </section>
+              <section class="card subscriptions-card">
+                <div class="card-top"><h2>订阅群组</h2><span id="group-count" class="count">0</span></div>
+                <ul id="group-list" class="group-list"></ul>
+                <p id="empty-groups" class="empty-state">还没有群组订阅</p>
+                <p class="hint">在目标群发送 <code>/lc订阅</code> 开启推送，发送 <code>/lc退订</code> 取消。</p>
+              </section>
+            </aside>
+          </div>
+        </fieldset>
+
+        <footer class="save-bar">
+          <div><strong id="save-state">正在加载配置…</strong><p id="save-hint">配置保存成功后立即应用，无需重启插件。</p></div>
+          <div class="save-actions"><button id="reset" type="button" class="button secondary" disabled>撤销修改</button><button id="save" type="submit" class="button primary" disabled>保存配置</button></div>
+        </footer>
+      </form>
+      <p class="page-footer">一天一道题，一点点积累。</p>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

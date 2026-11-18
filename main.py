@@ -8,17 +8,51 @@ import asyncio
 import json
 import os
 import re
-from datetime import datetime
-from typing import Dict, List, Optional, Set
+import tempfile
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 
+import astrbot.core.message.components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register, StarTools
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.message.message_event_result import MessageChain
-import astrbot.core.message.components as Comp
 
-from ._version import __version__, __plugin_name__, __author__, __plugin_desc__
+from ._version import __author__, __plugin_desc__, __plugin_name__, __version__
+
+try:
+    from astrbot.api.web import error_response, json_response, request
+
+    async def read_web_json():
+        return await request.json(default=None)
+
+except ImportError:
+    # Older AstrBot releases expose plugin Web APIs through Quart.
+    from quart import jsonify, request
+
+    def json_response(data):
+        return jsonify(data)
+
+    def error_response(message, *, status_code=400):
+        return jsonify({"status": "error", "message": message}), status_code
+
+    async def read_web_json():
+        return await request.get_json(silent=True)
+
+
+SETTING_DEFAULTS = {
+    "inform_hour": 9,
+    "inform_minute": 0,
+    "check_interval_seconds": 30,
+    "admin_users": [],
+}
+SETTING_CONFIG_KEYS = {
+    "inform_hour": "leetcode_inform_hour",
+    "inform_minute": "leetcode_inform_minute",
+    "check_interval_seconds": "leetcode_check_interval_seconds",
+    "admin_users": "admin_users",
+}
 
 
 def clean_html(html_content: str) -> str:
@@ -26,12 +60,17 @@ def clean_html(html_content: str) -> str:
     if not html_content:
         return ""
     # 移除HTML标签
-    text = re.sub(r'<[^>]+>', '', html_content)
+    text = re.sub(r"<[^>]+>", "", html_content)
     # 解码HTML实体
-    text = text.replace('&quot;', '"').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
-    text = text.replace('&nbsp;', ' ').replace('&#39;', "'")
+    text = (
+        text.replace("&quot;", '"')
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+    )
+    text = text.replace("&nbsp;", " ").replace("&#39;", "'")
     # 移除多余空白
-    text = re.sub(r'\n\s*\n', '\n\n', text)
+    text = re.sub(r"\n\s*\n", "\n\n", text)
     text = text.strip()
     return text
 
@@ -70,65 +109,89 @@ class LeetCodePlugin(Star):
         # HTTP 会话
         self._session = None
 
-        # 全局管理员列表
-        global ADMIN_USERS
-        ADMIN_USERS = self.admin_users.copy()
-
         # 文件写入锁
         self._file_lock = asyncio.Lock()
+        self._settings_lock = asyncio.Lock()
+        self._monitor_wakeup = asyncio.Event()
+        self._last_inform_date = ""
 
         # 异步任务
         self._monitor_task: Optional[asyncio.Task] = None
+        self.context.register_web_api(
+            f"/{__plugin_name__}/settings",
+            self.page_get_settings,
+            ["GET"],
+            "读取 LeetCode 配置和运行状态",
+        )
+        self.context.register_web_api(
+            f"/{__plugin_name__}/settings",
+            self.page_save_settings,
+            ["POST"],
+            "保存并应用 LeetCode 配置",
+        )
 
-        logger.info(f"LeetCode 每日一题提醒插件已加载")
+        logger.info("LeetCode 每日一题提醒插件已加载")
 
     def _load_config(self):
         """加载配置文件"""
         # 默认配置
         default_config = {
-            "check_interval_seconds": 3600,
-            "inform_hour": 9,
-            "inform_minute": 0,
-            "admin_users": [],
+            **SETTING_DEFAULTS,
             "group_origins": {},
-            "subscribed_groups": []
+            "subscribed_groups": [],
         }
 
         # 从文件加载配置
         if os.path.exists(self.config_file):
             try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
+                with open(self.config_file, "r", encoding="utf-8") as f:
                     loaded_config = json.load(f)
-                    default_config.update(loaded_config)
+                    if isinstance(loaded_config, dict):
+                        default_config.update(loaded_config)
             except json.JSONDecodeError as e:
                 logger.error(f"配置文件JSON格式错误: {e}")
             except Exception as e:
                 logger.error(f"加载配置文件失败: {e}")
 
         # 从 AstrBot 配置加载（优先级更高）
-        if self.config:
-            default_config["check_interval_seconds"] = self.config.get(
-                "leetcode_check_interval_seconds", default_config["check_interval_seconds"]
-            )
-            default_config["inform_hour"] = self.config.get(
-                "leetcode_inform_hour", default_config["inform_hour"]
-            )
-            default_config["inform_minute"] = self.config.get(
-                "leetcode_inform_minute", default_config["inform_minute"]
-            )
+        if self.config is not None:
+            migrating = not self.config.get("settings_migrated", False)
+            for field, config_key in SETTING_CONFIG_KEYS.items():
+                value = self.config.get(config_key, default_config[field])
+                # New schema defaults must not mask existing data/config.json settings.
+                if migrating and value == SETTING_DEFAULTS[field]:
+                    value = default_config[field]
+                if migrating and field == "admin_users":
+                    value = self.config.get("leetcode_admin_users", value)
+                default_config[field] = value
 
-            # 加载管理员列表
-            admin_from_config = self.config.get("leetcode_admin_users", [])
-            if admin_from_config:
-                default_config["admin_users"] = [str(u) for u in admin_from_config]
+        settings = {}
+        for field, fallback in SETTING_DEFAULTS.items():
+            try:
+                settings[field] = self._validate_settings(
+                    {field: default_config[field]}
+                )[field]
+            except ValueError as exc:
+                logger.warning(f"LeetCode 配置 {field} 无效，使用默认值: {exc}")
+                settings[field] = (
+                    fallback.copy() if isinstance(fallback, list) else fallback
+                )
+        self._apply_settings(settings)
+        if self.config is not None and not self.config.get("settings_migrated", False):
+            try:
+                self._persist_settings(settings)
+            except Exception as exc:
+                logger.error(f"迁移 LeetCode 配置失败: {exc}")
 
         # 加载订阅配置（动态修改的）
         if os.path.exists(self.subscription_file):
             try:
-                with open(self.subscription_file, 'r', encoding='utf-8') as f:
+                with open(self.subscription_file, "r", encoding="utf-8") as f:
                     sub_data = json.load(f)
                     if "subscribed_groups" in sub_data:
-                        default_config["subscribed_groups"] = sub_data["subscribed_groups"]
+                        default_config["subscribed_groups"] = sub_data[
+                            "subscribed_groups"
+                        ]
                     if "group_origins" in sub_data:
                         self.group_origins = sub_data["group_origins"]
             except json.JSONDecodeError as e:
@@ -136,11 +199,127 @@ class LeetCodePlugin(Star):
             except Exception as e:
                 logger.error(f"加载订阅配置失败: {e}")
 
-        self.check_interval_seconds = default_config["check_interval_seconds"]
-        self.inform_hour = default_config["inform_hour"]
-        self.inform_minute = default_config["inform_minute"]
-        self.admin_users = default_config["admin_users"]
         self.subscribed_groups = default_config["subscribed_groups"]
+
+    @staticmethod
+    def _validate_settings(payload):
+        """Validate both Web API updates and persisted configuration."""
+        if not isinstance(payload, dict) or not payload:
+            raise ValueError("请提交配置对象")
+        if set(payload) - SETTING_DEFAULTS.keys():
+            raise ValueError("包含不支持的配置项")
+        validated = {}
+        for field, value in payload.items():
+            if field == "admin_users":
+                if not isinstance(value, list) or any(
+                    not isinstance(user, str)
+                    or not user.strip()
+                    or len(user.strip()) > 128
+                    for user in value
+                ):
+                    raise ValueError(
+                        "管理员 ID 必须是非空字符串列表，每项不超过 128 个字符"
+                    )
+                validated[field] = list(dict.fromkeys(user.strip() for user in value))
+                continue
+            minimum, maximum, label = {
+                "inform_hour": (0, 23, "推送小时"),
+                "inform_minute": (0, 59, "推送分钟"),
+                "check_interval_seconds": (5, 30, "检查间隔（秒）"),
+            }[field]
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ValueError(f"{label}必须是 {minimum}–{maximum} 之间的整数")
+            validated[field] = value
+        return validated
+
+    def _apply_settings(self, settings):
+        for field, value in settings.items():
+            setattr(self, field, value)
+        global ADMIN_USERS
+        ADMIN_USERS = self.admin_users.copy()
+
+    def _persist_settings(self, settings):
+        """Persist before updating runtime state, retaining the previous values on failure."""
+        if self.config is not None:
+            previous = dict(self.config)
+            self.config.update(
+                {SETTING_CONFIG_KEYS[key]: value for key, value in settings.items()}
+            )
+            self.config["settings_migrated"] = True
+            try:
+                self.config.save_config()
+            except Exception:
+                self.config.clear()
+                self.config.update(previous)
+                raise
+            return
+        # Standalone deployments without AstrBotConfig keep using the original data directory.
+        data = {}
+        if os.path.exists(self.config_file):
+            with open(self.config_file, encoding="utf-8") as source:
+                data = json.load(source)
+            if not isinstance(data, dict):
+                raise ValueError("原配置文件必须是 JSON 对象")
+        data.update(settings)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.data_dir,
+                delete=False,
+            ) as target:
+                temp_path = target.name
+                json.dump(data, target, ensure_ascii=False, indent=2)
+            os.replace(temp_path, self.config_file)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def _settings_snapshot(self):
+        now = datetime.now().astimezone()
+        next_run = now.replace(
+            hour=self.inform_hour, minute=self.inform_minute, second=0, microsecond=0
+        )
+        if next_run + timedelta(
+            minutes=1
+        ) <= now or self._last_inform_date == now.strftime("%Y-%m-%d"):
+            next_run += timedelta(days=1)
+        return {
+            "settings": {field: getattr(self, field) for field in SETTING_DEFAULTS},
+            "runtime": {
+                "server_time": now.isoformat(timespec="seconds"),
+                "timezone": now.tzname(),
+                "next_run": next_run.isoformat(timespec="seconds"),
+                "subscribed_groups": list(self.subscribed_groups),
+                "monitor_running": self._monitor_task is not None
+                and not self._monitor_task.done(),
+            },
+        }
+
+    async def page_get_settings(self):
+        """Read configuration through the authenticated Dashboard plugin bridge."""
+        return json_response(self._settings_snapshot())
+
+    async def page_save_settings(self):
+        """Save validated settings and wake the scheduler without restarting the plugin."""
+        try:
+            changes = self._validate_settings(await read_web_json())
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        async with self._settings_lock:
+            settings = {field: getattr(self, field) for field in SETTING_DEFAULTS}
+            settings.update(changes)
+            try:
+                self._persist_settings(settings)
+            except Exception:
+                logger.exception("保存 LeetCode 配置失败")
+                return error_response(
+                    "无法写入配置，请检查文件权限后重试", status_code=500
+                )
+            self._apply_settings(settings)
+            self._monitor_wakeup.set()
+        return json_response(self._settings_snapshot())
 
     def _get_group_id(self, event: AstrMessageEvent) -> Optional[str]:
         """获取群组ID"""
@@ -152,7 +331,7 @@ class LeetCodePlugin(Star):
     def _save_group_origin(self, event: AstrMessageEvent):
         """保存群的统一会话标识"""
         group_id = self._get_group_id(event)
-        if group_id and hasattr(event, 'unified_msg_origin'):
+        if group_id and hasattr(event, "unified_msg_origin"):
             self.group_origins[group_id] = event.unified_msg_origin
 
     def _get_session_for_group(self, group_id: str) -> str:
@@ -197,7 +376,6 @@ class LeetCodePlugin(Star):
     async def _async_monitor(self):
         """异步监控任务"""
         logger.info("LeetCode 每日一题监控任务已启动")
-        last_inform_date = ""
 
         try:
             while True:
@@ -208,7 +386,7 @@ class LeetCodePlugin(Star):
                     # 检查是否需要通知
                     if (now.hour == self.inform_hour and
                         now.minute == self.inform_minute and
-                        today_date != last_inform_date):
+                        today_date != self._last_inform_date):
 
                         logger.info(f"开始获取 LeetCode 每日一题: {today_date}")
                         question = await self._fetch_daily_question()
@@ -216,13 +394,17 @@ class LeetCodePlugin(Star):
                             self.today_question = question
                             self.today_date = today_date
                             await self._send_question_to_subscribers(question)
-                            last_inform_date = today_date
+                            self._last_inform_date = today_date
                             logger.info(f"LeetCode 每日一题已推送: {question.get('title', '未知')}")
 
                 except Exception as e:
                     logger.error(f"LeetCode 监控任务出错: {e}")
 
-                await asyncio.sleep(30)
+                try:
+                    await asyncio.wait_for(self._monitor_wakeup.wait(), timeout=self.check_interval_seconds)
+                except asyncio.TimeoutError:
+                    pass
+                self._monitor_wakeup.clear()
 
         except asyncio.CancelledError:
             logger.info("LeetCode 每日一题监控任务已停止")
@@ -230,8 +412,8 @@ class LeetCodePlugin(Star):
     async def _fetch_daily_question(self) -> Optional[Dict]:
         """获取 LeetCode 每日一题 - 使用内置的 urllib"""
         try:
-            import urllib.request
             import ssl
+            import urllib.request
 
             url = "https://leetcode-api-pied.vercel.app/daily"
             logger.info(f"正在向 {url} 发送请求")
@@ -294,8 +476,8 @@ class LeetCodePlugin(Star):
     async def _fetch_question_by_id(self, question_id: str) -> Optional[Dict]:
         """根据题目号获取 LeetCode 题目详情"""
         try:
-            import urllib.request
             import ssl
+            import urllib.request
 
             # 使用 lcid.cc API 获取题目信息
             url = f"https://lcid.cc/info/{question_id}"
@@ -400,7 +582,7 @@ class LeetCodePlugin(Star):
         content = question.get("content", "")
         if content:
             clean_content = clean_html(content)
-            chain.append(Comp.Plain(f"\n📝 题目描述:\n"))
+            chain.append(Comp.Plain("\n📝 题目描述:\n"))
             # 分段发送，避免消息过长，上限3000字符
             max_length = 3000
             if len(clean_content) > max_length:
@@ -490,7 +672,7 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
 
 【配置】
 - 默认每日 09:00 推送
-- 可在插件配置中修改推送时间
+- 可在插件详情的「每日一题设置」视图中修改，保存后立即生效
 
 【提示】
 - 只有管理员可以使用管理命令

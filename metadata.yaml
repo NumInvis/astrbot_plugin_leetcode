@@ -19,3 +19,8 @@ help: |
 version: "1.0.0"
 author: NumInvis
 repo: https://github.com/NumInvis/astrbot_plugin_leetcode
+views:
+  - name: settings
+    target: plugin_page
+    title: 每日一题设置
+    description: 设置每日推送时间、管理员和检查间隔，查看订阅状态。

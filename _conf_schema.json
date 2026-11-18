@@ -2,7 +2,33 @@
   "admin_users": {
     "description": "管理员用户列表",
     "type": "list",
-    "hint": "可以管理插件的管理员用户ID列表",
+    "hint": "可以管理插件的管理员用户ID列表，也可在「每日一题设置」视图中修改。AstrBot 管理员始终拥有权限。",
     "default": []
+  },
+  "leetcode_inform_hour": {
+    "description": "每日推送小时",
+    "type": "int",
+    "default": 9,
+    "slider": {"min": 0, "max": 23, "step": 1},
+    "hint": "使用 AstrBot 所在服务器或容器的本地时间，所有订阅群共用。"
+  },
+  "leetcode_inform_minute": {
+    "description": "每日推送分钟",
+    "type": "int",
+    "default": 0,
+    "slider": {"min": 0, "max": 59, "step": 1}
+  },
+  "leetcode_check_interval_seconds": {
+    "description": "定时检查间隔（秒）",
+    "type": "int",
+    "default": 30,
+    "slider": {"min": 5, "max": 30, "step": 1},
+    "hint": "每隔多少秒检查是否到达推送时间，允许 5–30 秒，避免错过目标分钟。"
+  },
+  "settings_migrated": {
+    "description": "已迁移旧版配置",
+    "type": "bool",
+    "default": false,
+    "invisible": true
   }
 }
