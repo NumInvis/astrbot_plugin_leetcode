@@ -5,8 +5,22 @@ const fields = byId("fields");
 const timeInput = byId("inform-time");
 const adminInput = byId("admin-users");
 const intervalInput = byId("check-interval");
+const testForm = byId("test-push-form");
+const testGroupInput = byId("test-group");
+const testButton = byId("test-push");
 let savedSettings = null;
 let busy = false;
+let testing = false;
+let testGroups = new Map();
+
+function groupLabel(group) {
+  return `${group.group_name || "未知群名"}:${group.group_id}`;
+}
+
+function updateTestState() {
+  testGroupInput.disabled = testing || testGroups.size === 0;
+  testButton.disabled = testing || !savedSettings || !testGroups.get(testGroupInput.value)?.available;
+}
 
 function parseAdmins() {
   return [...new Set(adminInput.value.split(/[\s,，;；]+/u).filter(Boolean))];
@@ -66,18 +80,72 @@ function renderRuntime(runtime) {
   const offset = runtime.server_time?.match(/([+-]\d{2}:\d{2}|Z)$/)?.[0] || "";
   byId("server-timezone").textContent = `${runtime.timezone || "本地时区"}${offset ? ` · UTC${offset === "Z" ? "+00:00" : offset}` : ""}`;
   const groups = runtime.subscribed_groups;
+  const selectedGroup = testGroupInput.value;
+  testGroups = new Map((runtime.test_groups || []).map((group) => [group.group_id, group]));
   byId("group-count").textContent = String(groups.length);
   byId("empty-groups").hidden = groups.length > 0;
   byId("group-list").replaceChildren(...groups.map((id) => {
     const item = document.createElement("li");
-    item.textContent = String(id);
+    item.textContent = groupLabel(testGroups.get(String(id)) || { group_id: id });
     return item;
   }));
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = testGroups.size ? "请选择目标群组" : "暂无群组，请先在群内发送 /lc列表";
+  placeholder.disabled = true;
+  testGroupInput.replaceChildren(placeholder, ...[...testGroups.values()].map((group) => {
+    const option = document.createElement("option");
+    option.value = group.group_id;
+    option.textContent = `${groupLabel(group)}${group.available ? "" : "（会话待更新）"}`;
+    option.disabled = !group.available;
+    return option;
+  }));
+  testGroupInput.value = testGroups.get(selectedGroup)?.available ? selectedGroup : "";
+  updateTestState();
 }
 
-form.addEventListener("input", () => {
+form.addEventListener("input", (event) => {
+  if (event.target.form !== form) return;
   feedback("");
   updateFormState();
+});
+
+function testFeedback(message, error = false) {
+  const element = byId("test-result");
+  element.textContent = message;
+  element.classList.toggle("error", error);
+  element.hidden = !message;
+}
+
+testGroupInput.addEventListener("change", () => {
+  testFeedback("");
+  updateTestState();
+});
+
+testForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (testing || !savedSettings || !testForm.reportValidity()) return;
+  const groupId = testGroupInput.value.trim();
+  if (!testGroups.get(groupId)?.available) {
+    testFeedback("请先选择已记录且可测试的群组。", true);
+    testGroupInput.focus();
+    return;
+  }
+  testing = true;
+  testButton.disabled = true;
+  testGroupInput.disabled = true;
+  testButton.textContent = "正在发送…";
+  testFeedback("正在获取今日题目并发送，请稍候…");
+  try {
+    const result = await bridge.apiPost("test-push", { group_id: groupId });
+    testFeedback(`已向 ${groupLabel(result)} 提交测试推送：${result.question_title}`);
+  } catch (error) {
+    testFeedback(error.message || "测试推送失败，请稍后重试。", true);
+  } finally {
+    testing = false;
+    testButton.textContent = "发送测试题目";
+    updateTestState();
+  }
 });
 
 form.addEventListener("invalid", (event) => {
@@ -138,6 +206,7 @@ try {
   setForm(result.settings);
   renderRuntime(result.runtime);
   fields.disabled = false;
+  updateTestState();
   byId("connection").textContent = "已连接 AstrBot";
 } catch (error) {
   byId("connection").textContent = "连接失败";

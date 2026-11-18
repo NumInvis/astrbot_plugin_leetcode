@@ -64,6 +64,15 @@
                 <p id="empty-groups" class="empty-state">还没有群组订阅</p>
                 <p class="hint">在目标群发送 <code>/lc订阅</code> 开启推送，发送 <code>/lc退订</code> 取消。</p>
               </section>
+              <section class="card test-push-card">
+                <div class="card-top"><h2>测试推送</h2><span class="test-badge">指定群</span></div>
+                <label for="test-group">目标群组</label>
+                <select id="test-group" form="test-push-form" required aria-describedby="test-group-hint"><option value="">正在加载已记录群组…</option></select>
+                <p id="test-group-hint" class="hint">向指定群发送一次今日题目，消息带有测试标记，不影响正常定时推送。</p>
+                <button id="test-push" form="test-push-form" type="submit" class="button primary test-push-button" disabled>发送测试题目</button>
+                <p id="test-result" class="test-result" role="status" aria-live="polite" hidden></p>
+                <p class="hint">按「群名:群号」选择已记录的群。群名会自动记录并保存；未显示目标群或名称待补全时，请在该群发送 <code>/lc列表</code>，再点击「刷新状态」。</p>
+              </section>
             </aside>
           </div>
         </fieldset>
@@ -73,6 +82,7 @@
           <div class="save-actions"><button id="reset" type="button" class="button secondary" disabled>撤销修改</button><button id="save" type="submit" class="button primary" disabled>保存配置</button></div>
         </footer>
       </form>
+      <form id="test-push-form"></form>
       <p class="page-footer">一天一道题，一点点积累。</p>
     </main>
     <script type="module" src="./app.js"></script>

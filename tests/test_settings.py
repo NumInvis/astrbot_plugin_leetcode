@@ -40,6 +40,7 @@ class Config(dict):
 class Context:
     def __init__(self):
         self.routes = []
+        self.send_message = AsyncMock(return_value=True)
 
     def register_web_api(self, *args):
         self.routes.append(args)
@@ -95,6 +96,9 @@ def load_plugin():
     )
     modules["astrbot.core.config.astrbot_config"].AstrBotConfig = Config
     modules["astrbot.core.message.message_event_result"].MessageChain = list
+    modules["astrbot.core.message.components"].Plain = lambda text: (
+        types.SimpleNamespace(text=text)
+    )
     package = types.ModuleType("leetcode_test_plugin")
     package.__path__ = [str(ROOT)]
     modules[package.__name__] = package
@@ -155,7 +159,8 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reloaded.check_interval_seconds, 5)
         self.assertEqual(reloaded.admin_users, ["123", "456"])
         self.assertEqual(
-            [route[2] for route in reloaded.context.routes], [["GET"], ["POST"]]
+            [route[2] for route in reloaded.context.routes],
+            [["GET"], ["POST"], ["POST"]],
         )
 
     async def test_migration_preserves_legacy_time_and_explicit_later_reset(self):
@@ -266,6 +271,250 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
         plugin._fetch_daily_question.assert_awaited_once()
         plugin._send_question_to_subscribers.assert_awaited_once()
         self.assertEqual(intervals, [5, 10])
+
+    def prepare_test_push(self):
+        plugin = self.plugin()
+        plugin.group_origins = {
+            "123": "qq:GroupMessage:123",
+            "456": "qq:GroupMessage:456",
+        }
+        plugin.group_names = {"123": "算法训练群", "456": "每日刷题群"}
+        plugin.subscribed_groups = ["456"]
+        plugin.today_question = {"title": "Two Sum", "titleCn": "两数之和"}
+        plugin.today_date = datetime.now().strftime("%Y-%m-%d")
+        plugin._fetch_daily_question = AsyncMock(return_value=plugin.today_question)
+        request.payload = {"group_id": "123"}
+        return plugin
+
+    async def test_test_push_targets_only_requested_group_without_consuming_schedule(
+        self,
+    ):
+        plugin = self.prepare_test_push()
+        request.payload = {"group_id": " 123 "}
+        plugin._last_inform_date = "2026-11-17"
+        plugin._send_question_to_subscribers = AsyncMock()
+        saved_config = dict(plugin.config)
+        response = await plugin.page_test_push()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body["group_id"], "123")
+        self.assertEqual(response.body["group_name"], "算法训练群")
+        self.assertEqual(response.body["question_title"], "两数之和")
+        plugin.context.send_message.assert_awaited_once()
+        origin, chain = plugin.context.send_message.await_args.args
+        self.assertEqual(origin, "qq:GroupMessage:123")
+        self.assertIn("测试推送", chain[0].text)
+        self.assertIn("两数之和", "".join(component.text for component in chain))
+        plugin._fetch_daily_question.assert_not_awaited()
+        plugin._send_question_to_subscribers.assert_not_awaited()
+        self.assertEqual(plugin.subscribed_groups, ["456"])
+        self.assertEqual(plugin._last_inform_date, "2026-11-17")
+        self.assertEqual(dict(plugin.config), saved_config)
+        self.assertFalse(plugin._monitor_wakeup.is_set())
+
+    async def test_test_push_fetches_fresh_question_when_cache_is_from_previous_day(
+        self,
+    ):
+        plugin = self.prepare_test_push()
+        plugin.today_date = "2000-01-01"
+        fresh = {"title": "New Question"}
+        plugin._fetch_daily_question.return_value = fresh
+        response = await plugin.page_test_push()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body["question_title"], "New Question")
+        plugin._fetch_daily_question.assert_awaited_once()
+        self.assertEqual(plugin.today_question, fresh)
+        self.assertEqual(plugin.today_date, datetime.now().strftime("%Y-%m-%d"))
+
+    async def test_test_push_rejects_invalid_or_unknown_target_before_sending(self):
+        plugin = self.prepare_test_push()
+        for payload in (
+            None,
+            [],
+            {},
+            {"group_id": 123},
+            {"group_id": ""},
+            {"group_id": "123 456"},
+            {"group_id": "x" * 129},
+            {"group_id": "123\x00"},
+            {"group_id": "unknown"},
+            {"group_id": "123", "origin": "qq:FriendMessage:123"},
+        ):
+            with self.subTest(payload=payload):
+                request.payload = payload
+                response = await plugin.page_test_push()
+                self.assertEqual(response.status_code, 400)
+        plugin._fetch_daily_question.assert_not_awaited()
+        plugin.context.send_message.assert_not_awaited()
+
+    async def test_test_push_requires_saved_origin_even_for_subscribed_group(self):
+        plugin = self.prepare_test_push()
+        plugin.group_origins.pop("456")
+        request.payload = {"group_id": "456"}
+        response = await plugin.page_test_push()
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("/lc列表", response.body["message"])
+        plugin.context.send_message.assert_not_awaited()
+
+    async def test_test_push_does_not_send_when_question_fetch_fails(self):
+        plugin = self.prepare_test_push()
+        plugin.today_question = None
+        plugin._fetch_daily_question.return_value = None
+        response = await plugin.page_test_push()
+        self.assertEqual(response.status_code, 502)
+        plugin.context.send_message.assert_not_awaited()
+        self.assertFalse(plugin._test_push_lock.locked())
+
+    async def test_test_push_reports_missing_platform_send_error_and_timeout(self):
+        for outcome, status in (
+            (False, 502),
+            (RuntimeError("send denied"), 502),
+            (asyncio.TimeoutError(), 504),
+        ):
+            with self.subTest(outcome=outcome):
+                plugin = self.prepare_test_push()
+                if isinstance(outcome, Exception):
+                    plugin.context.send_message.side_effect = outcome
+                else:
+                    plugin.context.send_message.return_value = outcome
+                if isinstance(outcome, RuntimeError):
+                    with self.assertLogs("leetcode-tests", level="ERROR"):
+                        response = await plugin.page_test_push()
+                else:
+                    response = await plugin.page_test_push()
+                self.assertEqual(response.status_code, status)
+                self.assertFalse(plugin._test_push_lock.locked())
+                self.assertEqual(plugin._last_inform_date, "")
+
+    async def test_test_push_rejects_concurrent_requests_without_duplicate_send(self):
+        plugin = self.prepare_test_push()
+        plugin.today_question = None
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def fetch_question():
+            started.set()
+            await release.wait()
+            return {"title": "Concurrent question"}
+
+        plugin._fetch_daily_question.side_effect = fetch_question
+        first = asyncio.create_task(plugin.page_test_push())
+        await started.wait()
+        try:
+            response = await plugin.page_test_push()
+            self.assertEqual(response.status_code, 409)
+        finally:
+            release.set()
+            first_response = await first
+        self.assertEqual(first_response.status_code, 200)
+        plugin.context.send_message.assert_awaited_once()
+
+    async def test_runtime_lists_known_unsubscribed_groups_for_test_push(self):
+        plugin = self.prepare_test_push()
+        plugin.group_origins.pop("456")
+        response = await plugin.page_get_settings()
+        self.assertEqual(
+            response.body["runtime"]["test_groups"],
+            [
+                {
+                    "group_id": "123",
+                    "group_name": "算法训练群",
+                    "subscribed": False,
+                    "available": True,
+                },
+                {
+                    "group_id": "456",
+                    "group_name": "每日刷题群",
+                    "subscribed": True,
+                    "available": False,
+                },
+            ],
+        )
+
+    def group_event(self, name=None, queried_name=None):
+        return types.SimpleNamespace(
+            get_group_id=lambda: "123",
+            unified_msg_origin="qq:GroupMessage:123",
+            message_obj=types.SimpleNamespace(
+                group=types.SimpleNamespace(group_id="123", group_name=name),
+            ),
+            get_group=AsyncMock(
+                return_value=types.SimpleNamespace(group_name=queried_name)
+            ),
+            is_admin=lambda: True,
+            plain_result=lambda text: text,
+        )
+
+    async def test_group_names_and_origins_are_saved_before_subscription_and_survive_reload(
+        self,
+    ):
+        plugin = self.plugin()
+        event = self.group_event(name=" 算法训练群 ")
+        await plugin._save_group_origin(event)
+        event.get_group.assert_not_awaited()
+        self.assertEqual(plugin.subscribed_groups, [])
+        persisted = json.loads(Path(plugin.subscription_file).read_text())
+        self.assertEqual(persisted["group_names"], {"123": "算法训练群"})
+        reloaded = self.plugin()
+        self.assertEqual(reloaded.group_names["123"], "算法训练群")
+        self.assertEqual(reloaded.group_origins["123"], "qq:GroupMessage:123")
+        self.assertEqual(reloaded.subscribed_groups, [])
+
+    async def test_missing_group_name_is_enriched_through_platform_event(self):
+        plugin = self.plugin()
+        event = self.group_event(queried_name="平台返回的群名")
+        await plugin._save_group_origin(event)
+        event.get_group.assert_awaited_once()
+        self.assertEqual(self.plugin().group_names["123"], "平台返回的群名")
+
+    async def test_group_lookup_failure_keeps_route_and_existing_group_name(self):
+        plugin = self.plugin()
+        event = self.group_event(name="已存储群名")
+        await plugin._save_group_origin(event)
+        event.message_obj.group.group_name = None
+        event.get_group.side_effect = RuntimeError("platform unavailable")
+        await plugin._save_group_origin(event, refresh_name=True)
+        reloaded = self.plugin()
+        self.assertEqual(reloaded.group_names["123"], "已存储群名")
+        self.assertEqual(reloaded.group_origins["123"], "qq:GroupMessage:123")
+
+    async def test_group_list_command_updates_stored_name_without_subscribing(self):
+        plugin = self.plugin()
+        plugin.group_names["123"] = "旧群名"
+        event = self.group_event(queried_name="新群名")
+        replies = [reply async for reply in plugin.cmd_list(event)]
+        self.assertIn("未订阅", replies[0])
+        event.get_group.assert_awaited_once()
+        self.assertEqual(self.plugin().group_names["123"], "新群名")
+        self.assertEqual(plugin.subscribed_groups, [])
+
+    async def test_existing_group_names_load_from_legacy_and_subscription_files(self):
+        self.write_legacy(
+            {
+                "group_origins": {"123": "qq:GroupMessage:123"},
+                "group_names": {"123": "旧配置群名"},
+            }
+        )
+        plugin = self.plugin()
+        self.assertEqual(plugin.group_names["123"], "旧配置群名")
+        Path(plugin.subscription_file).write_text(
+            json.dumps(
+                {
+                    "subscribed_groups": ["123"],
+                    "group_names": {"123": "最近保存的群名"},
+                }
+            )
+        )
+        reloaded = self.plugin()
+        self.assertEqual(reloaded.group_names["123"], "最近保存的群名")
+        self.assertEqual(reloaded.group_origins["123"], "qq:GroupMessage:123")
+
+    async def test_platform_without_group_names_still_records_selectable_group(self):
+        plugin = self.plugin()
+        event = self.group_event()
+        await plugin._save_group_origin(event)
+        target = self.plugin()._settings_snapshot()["runtime"]["test_groups"][0]
+        self.assertEqual(target["group_name"], "")
+        self.assertEqual(target["group_id"], "123")
+        self.assertTrue(target["available"])
 
 
 if __name__ == "__main__":

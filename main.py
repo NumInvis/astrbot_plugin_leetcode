@@ -98,6 +98,7 @@ class LeetCodePlugin(Star):
 
         # 保存群的 unified_msg_origin
         self.group_origins: Dict[str, str] = {}
+        self.group_names: Dict[str, str] = {}
 
         # 加载配置
         self._load_config()
@@ -112,6 +113,7 @@ class LeetCodePlugin(Star):
         # 文件写入锁
         self._file_lock = asyncio.Lock()
         self._settings_lock = asyncio.Lock()
+        self._test_push_lock = asyncio.Lock()
         self._monitor_wakeup = asyncio.Event()
         self._last_inform_date = ""
 
@@ -129,6 +131,12 @@ class LeetCodePlugin(Star):
             ["POST"],
             "保存并应用 LeetCode 配置",
         )
+        self.context.register_web_api(
+            f"/{__plugin_name__}/test-push",
+            self.page_test_push,
+            ["POST"],
+            "向指定群测试推送今日题目",
+        )
 
         logger.info("LeetCode 每日一题提醒插件已加载")
 
@@ -138,6 +146,7 @@ class LeetCodePlugin(Star):
         default_config = {
             **SETTING_DEFAULTS,
             "group_origins": {},
+            "group_names": {},
             "subscribed_groups": [],
         }
 
@@ -183,6 +192,18 @@ class LeetCodePlugin(Star):
             except Exception as exc:
                 logger.error(f"迁移 LeetCode 配置失败: {exc}")
 
+        # Keep existing group metadata from legacy config.json deployments.
+        for field in ("group_origins", "group_names"):
+            values = default_config.get(field, {})
+            if isinstance(values, dict):
+                getattr(self, field).update(
+                    {
+                        str(key): value.strip()
+                        for key, value in values.items()
+                        if isinstance(value, str) and value.strip()
+                    }
+                )
+
         # 加载订阅配置（动态修改的）
         if os.path.exists(self.subscription_file):
             try:
@@ -192,8 +213,16 @@ class LeetCodePlugin(Star):
                         default_config["subscribed_groups"] = sub_data[
                             "subscribed_groups"
                         ]
-                    if "group_origins" in sub_data:
-                        self.group_origins = sub_data["group_origins"]
+                    for field in ("group_origins", "group_names"):
+                        values = sub_data.get(field, {})
+                        if isinstance(values, dict):
+                            getattr(self, field).update(
+                                {
+                                    str(key): value.strip()
+                                    for key, value in values.items()
+                                    if isinstance(value, str) and value.strip()
+                                }
+                            )
             except json.JSONDecodeError as e:
                 logger.error(f"订阅配置JSON格式错误: {e}")
             except Exception as e:
@@ -292,6 +321,19 @@ class LeetCodePlugin(Star):
                 "timezone": now.tzname(),
                 "next_run": next_run.isoformat(timespec="seconds"),
                 "subscribed_groups": list(self.subscribed_groups),
+                "test_groups": [
+                    {
+                        "group_id": group_id,
+                        "group_name": self.group_names.get(group_id, ""),
+                        "subscribed": group_id in self.subscribed_groups,
+                        "available": bool(self.group_origins.get(group_id)),
+                    }
+                    for group_id in sorted(
+                        {str(group) for group in self.subscribed_groups}
+                        | {str(group) for group in self.group_origins}
+                        | {str(group) for group in self.group_names}
+                    )
+                ],
                 "monitor_running": self._monitor_task is not None
                 and not self._monitor_task.done(),
             },
@@ -321,6 +363,76 @@ class LeetCodePlugin(Star):
             self._monitor_wakeup.set()
         return json_response(self._settings_snapshot())
 
+    async def page_test_push(self):
+        """Send today's question to one known group without consuming its scheduled push."""
+        payload = await read_web_json()
+        if not isinstance(payload, dict) or set(payload) != {"group_id"}:
+            return error_response("请提供要测试推送的群号", status_code=400)
+        group_id = payload["group_id"]
+        if not isinstance(group_id, str):
+            return error_response("群号必须是字符串", status_code=400)
+        group_id = group_id.strip()
+        if (
+            not group_id
+            or len(group_id) > 128
+            or any(char.isspace() or ord(char) < 32 for char in group_id)
+        ):
+            return error_response(
+                "请输入有效群号，长度不超过 128 个字符", status_code=400
+            )
+        origin = self.group_origins.get(group_id)
+        if not isinstance(origin, str) or not origin.strip():
+            return error_response(
+                "尚未记录该群会话，请先在目标群发送 /lc列表，再刷新状态后重试",
+                status_code=400,
+            )
+        if self._test_push_lock.locked():
+            return error_response("已有测试推送正在执行，请稍后重试", status_code=409)
+
+        async with self._test_push_lock:
+            today = datetime.now().strftime("%Y-%m-%d")
+            try:
+                question = self.today_question if self.today_date == today else None
+                if not question:
+                    question = await self._fetch_daily_question()
+                    if not question:
+                        return error_response(
+                            "获取今日题目失败，请稍后重试", status_code=502
+                        )
+                    self.today_question = question
+                    self.today_date = today
+                chain = [Comp.Plain("🧪 LeetCode 测试推送\n")]
+                chain.extend(self._build_question_message(question))
+                sent = await asyncio.wait_for(
+                    self.context.send_message(origin, MessageChain(chain)), timeout=30
+                )
+            except asyncio.TimeoutError:
+                return error_response(
+                    "发送超时，请先检查目标群是否已收到消息，再决定是否重试",
+                    status_code=504,
+                )
+            except Exception:
+                logger.exception(f"LeetCode 测试推送到群 {group_id} 失败")
+                return error_response(
+                    "测试推送失败，请检查机器人是否在目标群、平台连接和发送权限",
+                    status_code=502,
+                )
+            if not sent:
+                return error_response(
+                    "未找到该群对应的平台，请检查平台是否已连接并在目标群重新发送 /lc列表",
+                    status_code=502,
+                )
+        logger.info(f"LeetCode 测试推送已提交到群 {group_id}")
+        return json_response(
+            {
+                "group_id": group_id,
+                "group_name": self.group_names.get(group_id, ""),
+                "question_title": question.get("titleCn")
+                or question.get("title", "今日题目"),
+                "sent_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        )
+
     def _get_group_id(self, event: AstrMessageEvent) -> Optional[str]:
         """获取群组ID"""
         group_id = event.get_group_id()
@@ -328,11 +440,35 @@ class LeetCodePlugin(Star):
             return str(group_id)
         return None
 
-    def _save_group_origin(self, event: AstrMessageEvent):
-        """保存群的统一会话标识"""
+    async def _save_group_origin(self, event: AstrMessageEvent, *, refresh_name=False):
+        """Record group names and routes when handling a group command, including before subscription."""
         group_id = self._get_group_id(event)
-        if group_id and hasattr(event, "unified_msg_origin"):
-            self.group_origins[group_id] = event.unified_msg_origin
+        if not group_id:
+            return
+        previous = (self.group_origins.get(group_id), self.group_names.get(group_id))
+        origin = getattr(event, "unified_msg_origin", None)
+        if isinstance(origin, str) and origin:
+            self.group_origins[group_id] = origin
+        message = getattr(event, "message_obj", None)
+        group = getattr(message, "group", None)
+        name = getattr(group, "group_name", None) or getattr(
+            message, "group_name", None
+        )
+        if (
+            refresh_name or not name and not self.group_names.get(group_id)
+        ) and callable(getattr(event, "get_group", None)):
+            try:
+                details = await asyncio.wait_for(event.get_group(), timeout=5)
+                name = getattr(details, "group_name", None) or name
+            except Exception as exc:
+                logger.debug(f"读取群 {group_id} 名称失败，保留已有记录: {exc}")
+        if isinstance(name, str) and name.strip():
+            self.group_names[group_id] = name.strip()
+        if previous != (
+            self.group_origins.get(group_id),
+            self.group_names.get(group_id),
+        ):
+            await self._save_subscription()
 
     def _get_session_for_group(self, group_id: str) -> str:
         """获取群的会话标识"""
@@ -353,9 +489,10 @@ class LeetCodePlugin(Star):
             try:
                 data = {
                     "subscribed_groups": self.subscribed_groups,
-                    "group_origins": self.group_origins
+                    "group_origins": self.group_origins,
+                    "group_names": self.group_names,
                 }
-                with open(self.subscription_file, 'w', encoding='utf-8') as f:
+                with open(self.subscription_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
             except Exception as e:
                 logger.error(f"保存订阅配置失败: {e}")
@@ -620,7 +757,7 @@ class LeetCodePlugin(Star):
     @filter.command("lc菜单")
     async def cmd_menu(self, event: AstrMessageEvent):
         """显示主菜单"""
-        self._save_group_origin(event)
+        await self._save_group_origin(event)
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 只有管理员可以使用此命令")
             return
@@ -644,7 +781,7 @@ class LeetCodePlugin(Star):
     @filter.command("lc帮助")
     async def cmd_help(self, event: AstrMessageEvent):
         """显示详细帮助"""
-        self._save_group_origin(event)
+        await self._save_group_origin(event)
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 只有管理员可以使用此命令")
             return
@@ -683,7 +820,7 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
     @filter.command("lc订阅")
     async def cmd_subscribe(self, event: AstrMessageEvent):
         """订阅每日一题"""
-        self._save_group_origin(event)
+        await self._save_group_origin(event)
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 只有管理员可以使用此命令")
             return
@@ -705,7 +842,7 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
     @filter.command("lc退订")
     async def cmd_unsubscribe(self, event: AstrMessageEvent):
         """取消订阅"""
-        self._save_group_origin(event)
+        await self._save_group_origin(event)
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 只有管理员可以使用此命令")
             return
@@ -727,7 +864,7 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
     @filter.command("lc今日")
     async def cmd_today(self, event: AstrMessageEvent):
         """获取今日题目"""
-        self._save_group_origin(event)
+        await self._save_group_origin(event)
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 只有管理员可以使用此命令")
             return
@@ -754,7 +891,7 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
     @filter.command("lc列表")
     async def cmd_list(self, event: AstrMessageEvent):
         """查看当前群订阅状态"""
-        self._save_group_origin(event)
+        await self._save_group_origin(event, refresh_name=True)
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 只有管理员可以使用此命令")
             return
@@ -772,7 +909,7 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
     @filter.command("lc全部订阅")
     async def cmd_all_subscriptions(self, event: AstrMessageEvent):
         """查看所有群的订阅"""
-        self._save_group_origin(event)
+        await self._save_group_origin(event)
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 只有管理员可以使用此命令")
             return
@@ -791,7 +928,7 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
     @filter.command("lc题目")
     async def cmd_question(self, event: AstrMessageEvent, question_id: str = ""):
         """根据题目号查询题目，不传参数则获取今日题目"""
-        self._save_group_origin(event)
+        await self._save_group_origin(event)
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 只有管理员可以使用此命令")
             return
@@ -832,7 +969,7 @@ AI会提供：题目理解、解题思路、算法步骤、参考代码、关键
     @filter.command("lc解题")
     async def cmd_solve(self, event: AstrMessageEvent, question_id: str = ""):
         """使用AI分析并解答题目，不传参数则解答今日题目"""
-        self._save_group_origin(event)
+        await self._save_group_origin(event)
         if not self._is_admin(event):
             yield event.plain_result("⚠️ 只有管理员可以使用此命令")
             return
